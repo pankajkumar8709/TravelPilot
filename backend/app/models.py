@@ -41,6 +41,7 @@ class Place(Base):
     name: Mapped[str] = mapped_column(String(200))
     lat: Mapped[float] = mapped_column(Float)
     lon: Mapped[float] = mapped_column(Float)
+    city: Mapped[str] = mapped_column(String(80), default="delhi", index=True)  # city slug
     category: Mapped[str] = mapped_column(String(50))  # food/culture/outdoor/... or "hotel"
     interest_tag: Mapped[str] = mapped_column(String(50), default="")
     opening_hours: Mapped[str] = mapped_column(String(200), default="")  # OSM opening_hours string
@@ -56,6 +57,7 @@ class Amenity(Base):
     name: Mapped[str] = mapped_column(String(200), default="")
     lat: Mapped[float] = mapped_column(Float)
     lon: Mapped[float] = mapped_column(Float)
+    city: Mapped[str] = mapped_column(String(80), default="delhi", index=True)  # city slug
     type: Mapped[str] = mapped_column(String(30))  # toilets / atm / pharmacy
 
 
@@ -92,6 +94,7 @@ class Trip(Base):
     start_time_day1: Mapped[str] = mapped_column(String(8), default="09:00")
     pace: Mapped[str] = mapped_column(String(20), default="balanced")
     group_size: Mapped[int] = mapped_column(Integer, default=1)
+    city: Mapped[str] = mapped_column(String(80), default="delhi")  # resolved city slug
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     days: Mapped[list["Day"]] = relationship(back_populates="trip", cascade="all, delete-orphan")

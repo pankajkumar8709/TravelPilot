@@ -21,13 +21,19 @@ from app.services import llm
 SCHEDULABLE = {"culture", "outdoor", "history", "shopping", "nightlife"}
 
 
-def _travel_map(db: Session) -> dict[tuple[int, int], float]:
-    return {(t.from_id, t.to_id): t.duration_minutes for t in db.query(TravelTime).all()}
+def _travel_map(db: Session, city: str | None = None) -> dict[tuple[int, int], float]:
+    q = db.query(TravelTime)
+    if city is not None:
+        q = q.join(Place, TravelTime.from_id == Place.id).filter(Place.city == city)
+    return {(t.from_id, t.to_id): t.duration_minutes for t in q.all()}
 
 
-def _candidates(db: Session) -> list[CandidatePlace]:
+def _candidates(db: Session, city: str | None = None) -> list[CandidatePlace]:
+    q = db.query(Place)
+    if city is not None:
+        q = q.filter(Place.city == city)
     out = []
-    for p in db.query(Place).all():
+    for p in q.all():
         out.append(CandidatePlace(
             id=p.id, name=p.name, lat=p.lat, lon=p.lon, category=p.category,
             interest_tag=p.interest_tag, opening_hours=p.opening_hours,
@@ -38,8 +44,11 @@ def _candidates(db: Session) -> list[CandidatePlace]:
 
 
 def generate_trip(db: Session, trip: Trip) -> Trip:
-    all_places = _candidates(db)
-    tmap = _travel_map(db)
+    # Trip.city is the resolved slug (set at creation via ensure_city); fall back
+    # to all cached places when unset (legacy trips).
+    city = getattr(trip, "city", None)
+    all_places = _candidates(db, city)
+    tmap = _travel_map(db, city)
 
     def travel_fn(a, b):
         if a is None or b is None:
@@ -55,6 +64,11 @@ def generate_trip(db: Session, trip: Trip) -> Trip:
     food = [c for c in all_places if c.category == "food"]
     hotels = [c for c in all_places if c.category == "hotel"]
     hotel_id = trip.hotel_place_id or (hotels[0].id if hotels else None)
+    if not schedulable:
+        raise ValueError(
+            f"No plannable places cached for '{trip.destination}' — "
+            "could not build an itinerary."
+        )
 
     # wipe any prior days for idempotent regeneration
     for d in list(trip.days):

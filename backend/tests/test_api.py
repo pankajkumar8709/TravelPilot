@@ -20,6 +20,8 @@ def client():
     os.close(fd)
     os.environ["DATABASE_URL"] = f"sqlite:///{path}"
     os.environ["USE_MOCK_LLM"] = "true"
+    # hermetic: tests never hit Overpass/Nominatim/ORS live endpoints
+    os.environ["ALLOW_LIVE_INGESTION"] = "false"
 
     # import AFTER env is set so settings pick it up
     import importlib
@@ -139,3 +141,74 @@ def test_full_flow(client):
     # confirm the add applies it (reuses the disruption confirm path)
     applied = client.post(f"/trips/{trip['id']}/changes/{add['id']}/confirm").json()
     assert applied["status"] == "applied"
+
+
+@pytest.fixture()
+def client_offline(client):
+    """Same fresh-DB app, but with live ingestion disabled (hermetic guarantee)."""
+    os.environ["ALLOW_LIVE_INGESTION"] = "false"
+    import importlib
+    import app.config as cfg
+    importlib.reload(cfg)
+    import app.db as dbmod
+    importlib.reload(dbmod)
+    import app.services.trip_service as ts
+    importlib.reload(ts)
+    import app.main as mainmod
+    importlib.reload(mainmod)
+    # reseed the fresh temp DB (module reload rebinds SessionLocal)
+    import app.scripts.seed as seedmod
+    seedmod.seed()
+    from fastapi.testclient import TestClient
+    with TestClient(mainmod.app) as c:
+        yield c
+
+
+def test_chat_explore_and_add_flow(client_offline):
+    """'Show more places near X' -> options -> 'add this one' (place_id fast path).
+    Runs with ALLOW_LIVE_INGESTION=false so the test never touches the network."""
+    c = client_offline
+    trip = c.post("/trips", json={
+        "destination": "Delhi", "start_date": "2026-09-25", "end_date": "2026-09-26",
+        "budget_total": 400, "currency": "INR", "interests": ["history", "food"],
+    }).json()
+    assert len(trip["days"]) == 2
+
+    # explore near an activity actually in the plan
+    act = trip["days"][0]["activities"][0]
+    r = c.post("/chat/explore", json={"trip_id": trip["id"], "near_query": act["name"]}).json()
+    assert r["near"], "exploration reports its anchor"
+    assert isinstance(r["options"], list)
+    assert all(o["place_id"] not in {a["place_id"] for a in trip["days"][0]["activities"]}
+               for o in r["options"]), "explore never offers what's already planned"
+
+    if r["options"]:
+        pick = r["options"][0]
+        # 'add this place' — the place_id fast path (no name matching, no geocoding)
+        change = c.post("/chat/add", json={
+            "trip_id": trip["id"], "place_query": pick["name"], "place_id": pick["place_id"],
+        }).json()
+        assert change["status"] == "pending"
+        assert change["diff"]["added"][0]["place_id"] == pick["place_id"]
+
+
+def test_offline_unknown_city_falls_back(client_offline):
+    """ALLOW_LIVE_INGESTION=false: an unknown city falls back to the seeded one
+    instead of attempting a live fetch — generation still succeeds."""
+    c = client_offline
+    r = c.post("/trips", json={
+        "destination": "Nowhereland", "start_date": "2026-09-25", "end_date": "2026-09-26",
+        "budget_total": 300, "currency": "INR", "interests": ["history"],
+    })
+    assert r.status_code == 200, "offline fallback must keep generation working"
+    assert len(r.json()["days"]) == 2
+
+
+def test_mock_classifier_routes_new_actions():
+    """Offline mock classifier understands explore + change_destination phrasing."""
+    from app.services.llm import _mock_chat_action
+    assert _mock_chat_action("show me more places near India Gate")["action"] == "explore"
+    assert _mock_chat_action("what else is around Humayun's Tomb?")["action"] == "explore"
+    assert _mock_chat_action("take me to Jaipur instead")["action"] == "change_destination"
+    assert _mock_chat_action("take me to Jaipur instead")["slots"]["destination"] == "Jaipur"
+    assert _mock_chat_action("what about planning for Udaipur")["action"] == "change_destination"
