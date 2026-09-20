@@ -58,6 +58,9 @@ export function Intake({ onCreated }: { onCreated: (tripId: number) => void }) {
     setGenerating(true);
     setErr("");
     try {
+      // Pre-warm the city cache (no-op for Delhi; one-time OSM fetch for any
+      // other city in India or worldwide) so generation has places to schedule.
+      await api.prepCity(destination).catch(() => {});
       const trip = await api.createTrip({
         destination, start_date: start, end_date: end, budget_total: budget,
         currency: "INR", interests, start_time_day1: startTime, pace, group_size: 1,

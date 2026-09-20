@@ -58,9 +58,15 @@ export function Dashboard({ tripId, onReset }: { tripId: number; onReset: () => 
     } catch { setShareMsg("Couldn't copy the link — try again in a moment."); setTimeout(() => setShareMsg(""), 2000); }
   };
 
+  // Re-pull cached places when the trip's city changes (chat destination change
+  // re-ingests a new city, so the old cache is stale).
+  const tripCity = trip?.city;
   useEffect(() => {
     api.places().then(setPlaces);
     api.amenities().then(setAmenities);
+  }, [tripCity]);
+
+  useEffect(() => {
     refresh();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tripId]);
@@ -235,7 +241,8 @@ export function Dashboard({ tripId, onReset }: { tripId: number; onReset: () => 
         </AnimatePresence>
       </div>
 
-      <ChatPanel trip={trip} onApplied={applyChange} />
+      <ChatPanel trip={trip} onApplied={applyChange}
+        onTripReplaced={() => { setActiveDay(1); setDayRoute(null); refresh(); }} />
     </div>
   );
 }

@@ -1,8 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
-import { MessageCircle, X } from "lucide-react";
-import { api, type Change, type Trip } from "../api";
-import { SP, TYPE, MOTION, INK, FONT } from "../theme";
+import { MapPin, MessageCircle, Plus, X } from "lucide-react";
+import { api, type Change, type ExploreOption, type Trip } from "../api";
+import { SP, TYPE, MOTION, INK, FONT, tagColor } from "../theme";
 import { useUI } from "../ui-context";
 import { t } from "../i18n";
 import { DiffView } from "./DiffView";
@@ -10,7 +10,8 @@ import { DiffView } from "./DiffView";
 type Msg =
   | { role: "user"; text: string }
   | { role: "bot"; text: string }
-  | { role: "diff"; change: Change };
+  | { role: "diff"; change: Change }
+  | { role: "options"; near: string; options: ExploreOption[]; note: string };
 
 /**
  * Screen 4 — floating chat panel. Always dark (Ink) regardless of app mode,
@@ -21,14 +22,18 @@ type Msg =
 export function ChatPanel({
   trip,
   onApplied,
+  onTripReplaced,
 }: {
   trip: Trip;
   onApplied: (change: Change) => Promise<void>;
+  /** Called when the WHOLE trip is regenerated (destination change) so the parent refreshes. */
+  onTripReplaced?: () => void;
 }) {
   const { palette, lang } = useUI();
   const [open, setOpen] = useState(false);
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
+  const [addedIds, setAddedIds] = useState<number[]>([]);
   const [msgs, setMsgs] = useState<Msg[]>([{ role: "bot", text: t("chat_greeting", lang) }]);
   const scrollRef = useRef<HTMLDivElement>(null);
 
@@ -45,45 +50,37 @@ export function ChatPanel({
     push({ role: "user", text });
     setBusy(true);
     try {
-      const low = text.toLowerCase();
-      // ADD: "add <place>"
-      const addM = low.match(/\badd\s+(.+)/);
-      // MOVE: "move <place> to day N"
-      const moveM = low.match(/\bmove\s+(.+?)\s+to\s+day\s*(\d+)/);
-      if (moveM) {
-        const name = moveM[1];
-        const toDay = parseInt(moveM[2], 10);
-        const act = trip.days.flatMap((d) => d.activities).find((a) => a.name.toLowerCase().includes(name));
-        if (!act) { push({ role: "bot", text: `I couldn't find "${name}" in your plan.` }); }
-        else {
-          const change = await api.chatMove({ trip_id: trip.id, place_id: act.place_id, to_day_index: toDay, lang });
-          push({ role: "diff", change });
-        }
-      } else if (addM) {
-        let query = addM[1];
-        // extract an optional target day: "in day 3" / "on day 3" / "to day 3"
-        const dayM = query.match(/\b(?:in|on|to)\s+day\s*(\d+)/);
-        const dayIndex = dayM ? parseInt(dayM[1], 10) : null;
-        // strip day phrases and plan/trip filler from the place name
-        query = query
-          .replace(/\b(?:in|on|to)\s+day\s*\d+/g, "")
-          .replace(/\bto (my )?(plan|trip|itinerary)\b/g, "")
-          .replace(/\s+/g, " ")
-          .trim();
-        if (!query) { push({ role: "bot", text: "Which place should I add?" }); }
-        else {
-          const change = await api.chatAdd({ trip_id: trip.id, place_query: query, day_index: dayIndex, lang });
-          push({ role: "diff", change });
-        }
+      // One server-side router (Groq, or keyword mock offline) classifies the
+      // message and executes the matching handler — the browser never guesses.
+      const r = await api.chat({ trip_id: trip.id, message: text, lang });
+      if (r.kind === "diff") {
+        push({ role: "diff", change: r.change });
+      } else if (r.kind === "options") {
+        push({ role: "options", near: r.near, options: r.options, note: r.note });
+      } else if (r.kind === "regenerated") {
+        push({ role: "bot", text: `Plan rebuilt for ${r.trip.destination} — ${r.trip.days.length} day(s), fresh route and suggestions.` });
+        onTripReplaced?.();
       } else {
-        const r = await api.nl({ trip_id: trip.id, question: text, lang });
-        push({ role: "bot", text: r.answer });
+        push({ role: "bot", text: r.text });
       }
     } catch (e) {
       push({ role: "bot", text: `That request didn't go through — try again in a moment.` });
     } finally {
       setBusy(false);
     }
+  };
+
+  /** Explore option → 'add this place' → pending diff, same confirm flow. */
+  const addOption = async (opt: ExploreOption) => {
+    if (addedIds.includes(opt.place_id)) return;
+    setBusy(true);
+    try {
+      const change = await api.chatAdd({ trip_id: trip.id, place_query: opt.name, place_id: opt.place_id, lang });
+      setAddedIds((cur) => [...cur, opt.place_id]);
+      push({ role: "diff", change });
+    } catch {
+      push({ role: "bot", text: `Couldn't queue ${opt.name} — try again in a moment.` });
+    } finally { setBusy(false); }
   };
 
   const confirmDiff = async (idx: number, change: Change) => {
@@ -152,6 +149,11 @@ export function ChatPanel({
                     </div>
                   );
                 }
+                if (m.role === "options") {
+                  return <OptionList key={i} near={m.near} options={m.options} note={m.note}
+                    addedIds={addedIds} disabled={busy}
+                    onAdd={addOption} ink={ink} />;
+                }
                 const mine = m.role === "user";
                 return (
                   <motion.div key={i} initial={{ opacity: 0 }} animate={{ opacity: 1 }}
@@ -194,5 +196,58 @@ export function ChatPanel({
         )}
       </AnimatePresence>
     </>
+  );
+}
+
+/**
+ * Explore results — tappable place options from 'show more places near X'.
+ * Each has an explicit Add button; adding goes through the same pending-diff
+ * confirm flow as every other edit. Quiet satellite cards per the style guide.
+ */
+function OptionList({ near, options, note, addedIds, disabled, onAdd, ink }: {
+  near: string;
+  options: ExploreOption[];
+  note: string;
+  addedIds: number[];
+  disabled: boolean;
+  onAdd: (opt: ExploreOption) => void;
+  ink: { surface: string; border: string; text: string; dim: string };
+}) {
+  return (
+    <div style={{ justifySelf: "start", maxWidth: "100%", display: "grid", gap: 8 }}>
+      <div style={{ ...TYPE.narrative, fontSize: 15, color: ink.dim, display: "flex", alignItems: "center", gap: 6 }}>
+        <MapPin size={14} strokeWidth={1.8} /> More places near {near}
+      </div>
+      {options.map((o) => {
+        const added = addedIds.includes(o.place_id);
+        return (
+          <div key={o.place_id}
+            style={{ display: "flex", alignItems: "center", gap: 8, padding: "8px 10px",
+                     background: ink.surface, border: `1px solid ${ink.border}`, borderLeft: `3px solid ${tagColor(o.interest_tag)}`,
+                     borderRadius: 8 }}>
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div style={{ ...TYPE.small, fontWeight: 600, color: ink.text,
+                            whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+                {o.name}
+              </div>
+              <div style={{ ...TYPE.small, color: ink.dim, display: "flex", gap: 8 }}>
+                <span>{o.interest_tag}</span>
+                <span>{o.distance_km} km away</span>
+                {o.avg_visit_minutes ? <span>~{o.avg_visit_minutes} min</span> : null}
+              </div>
+            </div>
+            <button onClick={() => onAdd(o)} disabled={disabled || added}
+              aria-label={added ? `${o.name} queued` : `Add ${o.name} to plan`}
+              style={{ ...TYPE.small, fontWeight: 600, minHeight: 36, padding: "6px 10px", borderRadius: 8,
+                       cursor: added ? "default" : "pointer", border: "none",
+                       display: "inline-flex", alignItems: "center", gap: 4,
+                       background: added ? "transparent" : "#1F6F78", color: added ? ink.dim : "#F1F3F0" }}>
+              {added ? "Queued" : (<><Plus size={13} strokeWidth={2.2} /> Add</>)}
+            </button>
+          </div>
+        );
+      })}
+      {note && <div style={{ ...TYPE.small, color: ink.dim }}>{note}</div>}
+    </div>
   );
 }

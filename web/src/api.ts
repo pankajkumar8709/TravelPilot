@@ -55,6 +55,35 @@ export interface Change {
   diff: Diff;
 }
 
+/** Explore option — a tappable suggestion from 'show more places near X'. */
+export interface ExploreOption {
+  place_id: number;
+  name: string;
+  category: string;
+  interest_tag: string;
+  distance_km: number;
+  cost: number;
+  avg_visit_minutes: number;
+  image_url: string;
+  website: string;
+  lat: number;
+  lon: number;
+}
+
+export interface ExploreResult {
+  kind: "options";
+  near: string;
+  options: ExploreOption[];
+  note: string;
+}
+
+/** Union of everything POST /chat can reply with. */
+export type ChatReply =
+  | { kind: "answer"; text: string }
+  | { kind: "diff"; change: Change }
+  | { kind: "options"; near: string; options: ExploreOption[]; note: string }
+  | { kind: "regenerated"; status: string; city: string; trip: Trip };
+
 export interface Trip {
   id: number;
   destination: string;
@@ -64,6 +93,7 @@ export interface Trip {
   currency: string;
   interests: string[];
   hotel_place_id: number | null;
+  city?: string;
   days: Day[];
   pending_changes: Change[];
 }
@@ -140,7 +170,19 @@ export const api = {
     fetch(`${BASE}/nl/query`, {
       method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
     }).then(j<{ intent: string; slots: Record<string, string>; answer: string; degraded: boolean }>),
-  chatAdd: (body: { trip_id: number; place_query: string; day_index?: number | null; lang?: string }) =>
+  chat: (body: { trip_id: number; message: string; lang?: string }) =>
+    fetch(`${BASE}/chat`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+    }).then(j<ChatReply>),
+  prepCity: (destination: string) =>
+    fetch(`${BASE}/cities/prep`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ destination }),
+    }).then(j<{ city: string; places: number; ready: boolean }>),
+  changeDestination: (body: { trip_id: number; destination: string; lang?: string }) =>
+    fetch(`${BASE}/chat/change-destination`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+    }).then(j<{ status: string; city: string; trip: Trip }>),
+  chatAdd: (body: { trip_id: number; place_query: string; place_id?: number | null; day_index?: number | null; lang?: string }) =>
     fetch(`${BASE}/chat/add`, {
       method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
     }).then(j<Change>),

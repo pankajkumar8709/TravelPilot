@@ -5,7 +5,7 @@
 !.env.example
 .aws/
 *.pem
-
+.freebuff
 
 .kiro
 # --- python ---
