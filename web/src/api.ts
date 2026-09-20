@@ -89,6 +89,23 @@ export interface Amenity {
   type: string;
 }
 
+/** One cached/ORS-routed leg of the day's route (map view). */
+export interface RouteLeg {
+  from_place_id: number;
+  to_place_id: number;
+  from_name: string;
+  to_name: string;
+  geometry: [number, number][]; // [[lon, lat], ...]
+  cached: boolean;
+}
+
+export interface DayRoute {
+  day_index: number;
+  mode: string;
+  legs: RouteLeg[];
+  source: "cache" | "cache+ors" | "cache+fallback";
+}
+
 async function j<T>(r: Response): Promise<T> {
   if (!r.ok) throw new Error(`${r.status} ${await r.text()}`);
   return r.json();
@@ -135,5 +152,7 @@ export const api = {
     fetch(`${BASE}/chat/reorder`, {
       method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
     }).then(j<Change>),
+  dayRoute: (tripId: number, dayIndex: number) =>
+    fetch(`${BASE}/trips/${tripId}/days/${dayIndex}/route`).then(j<DayRoute>),
   share: (id: number) => fetch(`${BASE}/trips/${id}/share`).then(j<{ share_id: string; read_only: boolean }>),
 };

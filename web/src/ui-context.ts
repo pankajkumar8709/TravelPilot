@@ -17,9 +17,9 @@ export const UIContext = createContext<UIContextValue>({
   setLang: () => {},
   currency: "INR",
   setCurrency: () => {},
-  mode: "dark",
+  mode: "light",
   setMode: () => {},
-  palette: PALETTES.dark,
+  palette: PALETTES.light,
 });
 
 export const useUI = () => useContext(UIContext);

@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
+import { MessageCircle, X } from "lucide-react";
 import { api, type Change, type Trip } from "../api";
-import { SP, TYPE, MOTION } from "../theme";
+import { SP, TYPE, MOTION, INK, FONT } from "../theme";
 import { useUI } from "../ui-context";
 import { t } from "../i18n";
 import { DiffView } from "./DiffView";
@@ -12,10 +13,10 @@ type Msg =
   | { role: "diff"; change: Change };
 
 /**
- * Screen 4 — floating animated chat panel.
- * Floating pulse button → expands over a dimmed itinerary (not replacing it).
- * Routes ADD/MOVE → diff card w/ confirm-in-chat; QUESTION → inline answer.
- * On confirm, calls onApplied so the itinerary refreshes + highlights.
+ * Screen 4 — floating chat panel. Always dark (Ink) regardless of app mode,
+ * per the guide. Assistant messages are Newsreader italic — a distinct voice;
+ * user messages are Instrument Sans. Expands/collapses in ~200ms. The typing
+ * indicator is three dots with one slow easing pulse, not a bounce.
  */
 export function ChatPanel({
   trip,
@@ -79,7 +80,7 @@ export function ChatPanel({
         push({ role: "bot", text: r.answer });
       }
     } catch (e) {
-      push({ role: "bot", text: `Sorry — ${String(e).replace("Error: ", "")}` });
+      push({ role: "bot", text: `That request didn't go through — try again in a moment.` });
     } finally {
       setBusy(false);
     }
@@ -89,15 +90,23 @@ export function ChatPanel({
     setBusy(true);
     try {
       await onApplied(change);
-      setMsgs((cur) => cur.map((m, i) => (i === idx ? { role: "bot", text: "✓ Done — your itinerary is updated." } : m)));
+      setMsgs((cur) => cur.map((m, i) => (i === idx ? { role: "bot", text: "Done — your itinerary is updated." } : m)));
     } finally { setBusy(false); }
   };
   const rejectDiff = async (idx: number, change: Change) => {
     setBusy(true);
     try {
       await api.reject(trip.id, change.id);
-      setMsgs((cur) => cur.map((m, i) => (i === idx ? { role: "bot", text: "No problem — nothing changed." } : m)));
+      setMsgs((cur) => cur.map((m, i) => (i === idx ? { role: "bot", text: "Nothing changed — the plan stands as it was." } : m)));
     } finally { setBusy(false); }
+  };
+
+  // Chat surfaces are always Ink, independent of the app mode.
+  const ink = {
+    surface: "#FFFFFF14",
+    border: "#FFFFFF24",
+    text: "#F1F3F0",
+    dim: "#9CA5B4",
   };
 
   return (
@@ -107,30 +116,29 @@ export function ChatPanel({
         {open && (
           <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
             onClick={() => setOpen(false)}
-            style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.45)", zIndex: 900 }} />
+            style={{ position: "fixed", inset: 0, background: "rgba(16,21,31,0.45)", zIndex: 900 }} />
         )}
       </AnimatePresence>
 
       {/* floating button */}
-      <motion.button onClick={() => setOpen((v) => !v)}
-        whileHover={{ scale: 1.06 }} whileTap={{ scale: 0.94 }}
-        style={{ position: "fixed", bottom: 24, right: 24, zIndex: 1001, width: 60, height: 60, borderRadius: "50%",
+      <motion.button onClick={() => setOpen((v) => !v)} aria-label={open ? "Close assistant" : "Open assistant"}
+        whileTap={{ scale: 0.96 }}
+        style={{ position: "fixed", bottom: 24, right: 24, zIndex: 1001, width: 56, height: 56, borderRadius: "50%",
                  border: "none", cursor: "pointer", background: palette.accent, color: palette.accentText,
-                 fontSize: 26, boxShadow: palette.shadow,
-                 animation: open ? "none" : "tp-pulse 2.4s ease-in-out infinite" }}>
-        {open ? "✕" : "✦"}
+                 display: "grid", placeItems: "center", boxShadow: palette.shadow }}>
+        {open ? <X size={24} strokeWidth={1.8} /> : <MessageCircle size={24} strokeWidth={1.8} />}
       </motion.button>
 
       {/* panel */}
       <AnimatePresence>
         {open && (
-          <motion.div initial={{ opacity: 0, y: 30, scale: 0.98 }} animate={{ opacity: 1, y: 0, scale: 1 }}
-            exit={{ opacity: 0, y: 30, scale: 0.98 }} transition={{ duration: MOTION.base, ease: MOTION.ease }}
+          <motion.div initial={{ opacity: 0, y: 24, scale: 0.98 }} animate={{ opacity: 1, y: 0, scale: 1 }}
+            exit={{ opacity: 0, y: 24, scale: 0.98 }} transition={{ duration: MOTION.base, ease: MOTION.ease }}
             style={{ position: "fixed", bottom: 96, right: 24, zIndex: 1002, width: "min(420px, calc(100vw - 32px))",
                      height: "min(560px, calc(100vh - 140px))", display: "flex", flexDirection: "column",
-                     background: palette.bgElev, border: `1px solid ${palette.border}`, borderRadius: 20,
+                     background: INK, border: `1px solid ${ink.border}`, borderRadius: 16,
                      overflow: "hidden", boxShadow: palette.shadow }}>
-            <div style={{ padding: SP.md, borderBottom: `1px solid ${palette.border}`, ...TYPE.h3, color: palette.text }}>
+            <div style={{ padding: SP.md, borderBottom: `1px solid ${ink.border}`, ...TYPE.h3, color: ink.text }}>
               {t("chat_title", lang)}
             </div>
 
@@ -146,36 +154,40 @@ export function ChatPanel({
                 }
                 const mine = m.role === "user";
                 return (
-                  <motion.div key={i} initial={{ opacity: 0, y: 6 }} animate={{ opacity: 1, y: 0 }}
+                  <motion.div key={i} initial={{ opacity: 0 }} animate={{ opacity: 1 }}
                     style={{ justifySelf: mine ? "end" : "start", maxWidth: "85%",
-                             ...TYPE.body, padding: "8px 12px", borderRadius: 14,
-                             background: mine ? palette.accent : palette.surfaceAlt,
-                             color: mine ? palette.accentText : palette.text }}>
+                             ...(mine ? { ...TYPE.body, fontFamily: FONT.display, fontSize: 15 } : TYPE.narrative),
+                             padding: "8px 12px", borderRadius: 12,
+                             background: mine ? ink.surface : "transparent",
+                             border: mine ? "none" : `1px solid transparent`,
+                             color: mine ? ink.text : ink.dim }}>
                     {m.text}
                   </motion.div>
                 );
               })}
               {busy && (
-                <div style={{ justifySelf: "start", display: "flex", gap: 4, padding: "10px 12px" }}>
+                <div aria-label={t("thinking", lang)}
+                  style={{ justifySelf: "start", display: "flex", gap: 5, padding: "10px 4px" }}>
                   {[0, 1, 2].map((k) => (
-                    <motion.span key={k} animate={{ opacity: [0.3, 1, 0.3] }}
-                      transition={{ duration: 0.9, repeat: Infinity, delay: k * 0.15 }}
-                      style={{ width: 7, height: 7, borderRadius: "50%", background: palette.textDim }} />
+                    <motion.span key={k} animate={{ opacity: [0.25, 1, 0.25] }}
+                      transition={{ duration: 1.6, repeat: Infinity, ease: "easeInOut" }}
+                      style={{ width: 6, height: 6, borderRadius: "50%", background: ink.dim }} />
                   ))}
                 </div>
               )}
             </div>
 
-            <div style={{ padding: SP.sm, borderTop: `1px solid ${palette.border}`, display: "flex", gap: SP.xs }}>
+            <div style={{ padding: SP.sm, borderTop: `1px solid ${ink.border}`, display: "flex", gap: SP.xs }}>
               <input value={input} onChange={(e) => setInput(e.target.value)}
                 onKeyDown={(e) => e.key === "Enter" && send()}
                 placeholder={t("chat_placeholder", lang)}
-                style={{ ...TYPE.body, flex: 1, padding: "10px 12px", borderRadius: 12,
-                         background: palette.surfaceAlt, color: palette.text, border: `1px solid ${palette.border}` }} />
+                style={{ ...TYPE.body, fontSize: 15, flex: 1, minHeight: 44, padding: "8px 12px", borderRadius: 10,
+                         background: ink.surface, color: ink.text, border: `1px solid ${ink.border}` }} />
               <button onClick={send} disabled={busy}
-                style={{ ...TYPE.body, fontWeight: 600, padding: "10px 16px", borderRadius: 12, border: "none",
+                style={{ ...TYPE.body, fontFamily: FONT.display, fontSize: 15, fontWeight: 500, minHeight: 44,
+                         padding: "8px 16px", borderRadius: 10, border: "none",
                          cursor: "pointer", background: palette.accent, color: palette.accentText }}>
-                →
+                {t("ask", lang)}
               </button>
             </div>
           </motion.div>

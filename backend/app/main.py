@@ -23,10 +23,11 @@ from app.core.scheduler import PlannedActivity
 from app.core.repair import repair_day
 from app.core.timeutil import to_min
 from app.db import get_db, init_db
-from app.models import Activity, Booking, Day, ItineraryChange, Place, Trip, Amenity, Suggestion, TravelTime
+from app.models import Activity, Booking, Day, ItineraryChange, Place, Trip, Amenity, Suggestion, TravelTime, Route
 from app.schemas import ChatAdd, ChatMessage, ChatMove, ChatReorder, DisruptionInject, NLQuery, TripCreate
 from app.services import llm
 from app.services.trip_service import generate_trip
+from app.services import ors as ors_service
 
 app = FastAPI(title="TravelPilot", version="1.0")
 app.add_middleware(
@@ -215,6 +216,59 @@ def reject_change(trip_id: int, cid: int, db: Session = Depends(get_db)):
     change.status = "rejected"
     db.commit()
     return {"status": "rejected"}
+
+
+@app.get("/trips/{trip_id}/days/{day_index}/route")
+def day_route(trip_id: int, day_index: int, db: Session = Depends(get_db)):
+    """Route geometry for one day, for the map view — cache-first.
+
+    Legs are looked up in the cached `routes` table (ingestion or a previous
+    fetch); on a miss, ORS Directions is called once and persisted. Without a
+    key or when ORS is unreachable, legs fall back to straight lines, so the
+    map always renders. Per the plan's Phase 3 principle, this is the ONLY
+    runtime code path that may call ORS, and only on a cache miss.
+    """
+    trip = db.get(Trip, trip_id)
+    if not trip:
+        raise HTTPException(404, "trip not found")
+    day = db.query(Day).filter_by(trip_id=trip_id, day_index=day_index).first()
+    if not day:
+        raise HTTPException(404, "day not found")
+
+    acts = db.query(Activity).filter_by(day_id=day.id).order_by(Activity.seq).all()
+    if not acts:
+        raise HTTPException(404, "day has no activities to route")
+
+    hotel = db.get(Place, trip.hotel_place_id) if trip.hotel_place_id else None
+    stops = [hotel] + [db.get(Place, a.place_id) for a in acts]
+
+    legs, fetched = [], 0
+    for a, b in zip(stops, stops[1:]):
+        if not a or not b:
+            continue
+        if a.id == b.id:
+            continue
+        a_ll = [a.lon, a.lat]
+        b_ll = [b.lon, b.lat]
+        cached = db.query(Route).filter_by(from_id=a.id, to_id=b.id).first()
+        if cached and cached.geometry and len(cached.geometry) >= 2:
+            geom, was_cached = cached.geometry, True
+        else:
+            geom = ors_service.ors_route_cached(db, a.id, b.id, a_ll, b_ll)
+            was_cached = False
+            fetched += 1
+        legs.append({
+            "from_place_id": a.id, "to_place_id": b.id,
+            "from_name": a.name, "to_name": b.name,
+            "geometry": geom,
+            "cached": was_cached,
+        })
+    return {
+        "day_index": day_index,
+        "mode": "foot-walking",
+        "legs": legs,
+        "source": "cache" if fetched == 0 else ("cache+ors" if settings.ors_api_key else "cache+fallback"),
+    }
 
 
 @app.get("/places/search")

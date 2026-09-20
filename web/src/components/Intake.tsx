@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import { api } from "../api";
-import { SP, TYPE, RADIUS, MOTION, tagColor } from "../theme";
+import { SP, TYPE, RADIUS, MOTION, tagColor, FONT } from "../theme";
 import { useUI } from "../ui-context";
 import { stepSwap } from "../motion";
 import { t } from "../i18n";
@@ -11,7 +11,12 @@ const INTERESTS = ["culture", "history", "outdoor", "food", "shopping", "nightli
 const STEPS = ["destination", "dates", "starttime", "budget", "interests", "pace"] as const;
 type Step = (typeof STEPS)[number];
 
-/** Screen 2 — conversational trip intake (one question at a time). */
+/**
+ * Screen 2 — conversational trip intake (one question at a time).
+ * Sequential content, but per the guide NO decorative connecting line here —
+ * the spine is earned only by genuinely sequential itinerary content.
+ * Labels are Instrument Sans sentence case; helper prose is Newsreader.
+ */
 export function Intake({ onCreated }: { onCreated: (tripId: number) => void }) {
   const { palette, lang, setCurrency } = useUI();
   const [step, setStep] = useState(0);
@@ -62,7 +67,7 @@ export function Intake({ onCreated }: { onCreated: (tripId: number) => void }) {
       await new Promise((r) => setTimeout(r, 900));
       onCreated(trip.id);
     } catch (e) {
-      setErr(String(e));
+      setErr("Couldn't generate the itinerary — check the backend is running, then try again.");
       setGenerating(false);
     }
   };
@@ -74,7 +79,7 @@ export function Intake({ onCreated }: { onCreated: (tripId: number) => void }) {
   return (
     <div style={{ maxWidth: 560, margin: "0 auto", minHeight: "60vh", display: "grid", alignContent: "center", gap: SP.lg }}>
       {/* progress */}
-      <div style={{ height: 6, background: palette.surfaceAlt, borderRadius: 999, overflow: "hidden" }}>
+      <div style={{ height: 4, background: palette.surfaceAlt, borderRadius: 999, overflow: "hidden" }}>
         <motion.div animate={{ width: `${pct}%` }} transition={{ duration: MOTION.base, ease: MOTION.ease }}
           style={{ height: "100%", background: palette.accent }} />
       </div>
@@ -90,8 +95,8 @@ export function Intake({ onCreated }: { onCreated: (tripId: number) => void }) {
                 <div style={{ display: "flex", flexWrap: "wrap", gap: SP.xs }}>
                   {sug.slice(0, 5).map((s) => (
                     <button key={s.id} onClick={() => { setDestination(s.name); setSug([]); }}
-                      style={{ ...TYPE.small, padding: "4px 10px", borderRadius: 999, cursor: "pointer",
-                               border: `1px solid ${palette.border}`, background: palette.surfaceAlt, color: palette.text }}>
+                      style={{ ...TYPE.small, minHeight: 44, padding: "8px 14px", borderRadius: 999, cursor: "pointer",
+                               border: `1px solid ${palette.border}`, background: palette.surface, color: palette.text }}>
                       {s.name}
                     </button>
                   ))}
@@ -117,9 +122,11 @@ export function Intake({ onCreated }: { onCreated: (tripId: number) => void }) {
 
           {current === "budget" && (
             <Q label={t("q_budget", lang)}>
-              <div style={{ ...TYPE.h2, color: palette.text }}>₹{budget.toLocaleString("en-IN")}</div>
+              <div style={{ ...TYPE.h2, color: palette.text, fontVariantNumeric: "tabular-nums" }}>
+                ₹{budget.toLocaleString("en-IN")}
+              </div>
               <input type="range" min={1000} max={30000} step={500} value={budget}
-                onChange={(e) => setBudget(Number(e.target.value))} style={{ width: "100%" }} />
+                onChange={(e) => setBudget(Number(e.target.value))} style={{ width: "100%", accentColor: palette.accent }} />
             </Q>
           )}
 
@@ -129,11 +136,13 @@ export function Intake({ onCreated }: { onCreated: (tripId: number) => void }) {
                 {INTERESTS.map((tag) => {
                   const on = interests.includes(tag);
                   return (
-                    <motion.button key={tag} onClick={() => toggle(tag)} whileTap={{ scale: 0.95 }}
-                      style={{ ...TYPE.body, fontWeight: 600, padding: "8px 16px", borderRadius: 999, cursor: "pointer",
-                               border: `1.5px solid ${tagColor(tag)}`,
-                               background: on ? tagColor(tag) : "transparent",
-                               color: on ? "#0F1117" : tagColor(tag) }}>
+                    <motion.button key={tag} onClick={() => toggle(tag)} whileTap={{ scale: 0.97 }}
+                      aria-pressed={on}
+                      style={{ ...TYPE.body, fontFamily: FONT.display, fontSize: 15, minHeight: 44, padding: "10px 18px",
+                               borderRadius: 999, cursor: "pointer",
+                               border: `1.5px solid ${on ? palette.accent : tagColor(tag)}`,
+                               background: on ? palette.accent : "transparent",
+                               color: on ? palette.accentText : palette.text }}>
                       {tag}
                     </motion.button>
                   );
@@ -146,8 +155,9 @@ export function Intake({ onCreated }: { onCreated: (tripId: number) => void }) {
             <Q label={t("q_pace", lang)}>
               <div style={{ display: "flex", gap: SP.sm }}>
                 {(["relaxed", "balanced", "packed"] as const).map((p) => (
-                  <button key={p} onClick={() => setPace(p)}
-                    style={{ ...TYPE.body, fontWeight: 600, flex: 1, padding: "12px", borderRadius: RADIUS, cursor: "pointer",
+                  <button key={p} onClick={() => setPace(p)} aria-pressed={pace === p}
+                    style={{ ...TYPE.body, fontFamily: FONT.display, fontSize: 15, minHeight: 44, flex: 1, padding: "12px",
+                             borderRadius: RADIUS, cursor: "pointer",
                              border: `1.5px solid ${pace === p ? palette.accent : palette.border}`,
                              background: pace === p ? palette.accent : palette.surface,
                              color: pace === p ? palette.accentText : palette.text }}>
@@ -160,21 +170,22 @@ export function Intake({ onCreated }: { onCreated: (tripId: number) => void }) {
         </motion.div>
       </AnimatePresence>
 
-      {err && <p style={{ ...TYPE.small, color: "#EF4444" }}>{err}</p>}
+      {err && <p style={{ ...TYPE.small, color: "#B42318" }}>{err}</p>}
 
       <div style={{ display: "flex", gap: SP.sm, justifyContent: "space-between" }}>
         <button onClick={() => setStep(Math.max(0, step - 1))} disabled={step === 0}
-          style={{ ...TYPE.body, padding: "10px 20px", borderRadius: RADIUS, cursor: "pointer",
-                   border: `1px solid ${palette.border}`, background: "transparent", color: palette.text,
+          style={{ ...TYPE.body, fontFamily: FONT.display, fontSize: 15, fontWeight: 500, minHeight: 44,
+                   padding: "10px 20px", borderRadius: RADIUS, cursor: "pointer",
+                   border: "none", background: "transparent", color: palette.text,
                    opacity: step === 0 ? 0.4 : 1 }}>
           {t("back", lang)}
         </button>
-        <motion.button onClick={advance} disabled={!canNext} whileHover={{ scale: canNext ? 1.03 : 1 }} whileTap={{ scale: 0.97 }}
-          style={{ ...TYPE.h3, padding: "10px 28px", borderRadius: RADIUS, border: "none",
+        <button onClick={advance} disabled={!canNext}
+          style={{ ...TYPE.h3, minHeight: 44, padding: "10px 28px", borderRadius: RADIUS, border: "none",
                    cursor: canNext ? "pointer" : "not-allowed", background: palette.accent, color: palette.accentText,
                    opacity: canNext ? 1 : 0.5 }}>
           {step === STEPS.length - 1 ? t("generate", lang) : t("next", lang)}
-        </motion.button>
+        </button>
       </div>
     </div>
   );
@@ -185,13 +196,13 @@ function Q({ label, hint, children }: { label: string; hint?: string; children: 
   return (
     <div style={{ display: "grid", gap: SP.sm }}>
       <h1 style={{ ...TYPE.h1, color: palette.text, margin: 0 }}>{label}</h1>
-      {hint && <p style={{ ...TYPE.small, color: palette.textDim, margin: 0 }}>{hint}</p>}
+      {hint && <p style={{ ...TYPE.narrative, fontSize: 15, color: palette.textDim, margin: 0 }}>{hint}</p>}
       {children}
     </div>
   );
 }
 
-const inp = (palette: { surfaceAlt: string; text: string; border: string }): React.CSSProperties => ({
-  ...TYPE.body, flex: 1, padding: "12px 14px", borderRadius: 12,
-  background: palette.surfaceAlt, color: palette.text, border: `1px solid ${palette.border}`,
+const inp = (palette: { surface: string; surfaceAlt: string; text: string; border: string }): React.CSSProperties => ({
+  ...TYPE.body, fontSize: 16, minHeight: 44, flex: 1, padding: "10px 14px", borderRadius: 10,
+  background: palette.surface, color: palette.text, border: `1px solid ${palette.border}`,
 });

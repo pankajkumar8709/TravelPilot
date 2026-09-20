@@ -1,6 +1,7 @@
 # --- secrets / env (NEVER commit) ---
 .env
 *.env
+.env.*
 !.env.example
 .aws/
 *.pem

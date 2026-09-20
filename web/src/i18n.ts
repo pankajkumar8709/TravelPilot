@@ -61,6 +61,14 @@ const STRINGS: Dict = {
   chat_placeholder: { en: "Add IIT Delhi, move the fort to day 2, or ask anything…", hi: "IIT दिल्ली जोड़ें, किला दिन 2 पर ले जाएँ, या कुछ भी पूछें…", ta: "IIT டெல்லியைச் சேர், கோட்டையை நாள் 2க்கு நகர்த்து, அல்லது கேள்…", bn: "IIT দিল্লি যোগ করুন, দুর্গ দিন ২-এ সরান, বা যেকোনো প্রশ্ন করুন…" },
   chat_greeting: { en: "Hi! Tell me to add a place, move an activity, or ask about your trip.", hi: "नमस्ते! कोई जगह जोड़ने, गतिविधि हटाने, या यात्रा के बारे में पूछने को कहें।", ta: "வணக்கம்! ஒரு இடத்தைச் சேர்க்க, நடவடிக்கையை நகர்த்த, அல்லது பயணம் பற்றி கேளுங்கள்.", bn: "হাই! একটি জায়গা যোগ করতে, কার্যক্রম সরাতে, বা ভ্রমণ সম্পর্কে জিজ্ঞাসা করুন।" },
   thinking: { en: "Thinking…", hi: "सोच रहा हूँ…", ta: "யோசிக்கிறேன்…", bn: "ভাবছি…" },
+  share: { en: "Share", hi: "शेयर", ta: "பங்கிடு", bn: "শেয়ার" },
+  share_copied: { en: "Link copied", hi: "लिंक कॉपी हुआ", ta: "இணைப்பு நகலெடுக்கப்பட்டது", bn: "লিংক কপি হয়েছে" },
+  over_budget: { en: "over budget", hi: "बजट से अधिक", ta: "பட்ஜெட்டை மீறியது", bn: "বাজেটের বেশি" },
+  sug_food: { en: "Food suggestion", hi: "भोजन सुझाव", ta: "உணவு பரிந்துரை", bn: "খাবারের পরামর্শ" },
+  sug_stay: { en: "Stay suggestion", hi: "ठहरने का सुझाव", ta: "தங்கும் பரிந்துரை", bn: "থাকার পরামর্শ" },
+  why_this: { en: "Why this?", hi: "यह क्यों?", ta: "ஏன் இது?", bn: "কেন এটি?" },
+  to_next: { en: "to next stop", hi: "अगली जगह तक", ta: "அடுத்த இடத்திற்கு", bn: "পরের স্টপ পর্যন্ত" },
+  h_unit: { en: "h", hi: "घं", ta: "மணி", bn: "ঘ" },
 };
 
 export function t(key: string, lang: Lang): string {
