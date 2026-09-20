@@ -41,7 +41,7 @@ def seed() -> dict:
         want_images = os.environ.get("SEED_IMAGES", "1") != "0"
         for (name, lat, lon, cat, tag, oh, visit, cost, site) in PARIS_PLACES:
             img = image_for(name) if want_images else ""
-            p = Place(name=name, lat=lat, lon=lon, category=cat, interest_tag=tag,
+            p = Place(name=name, lat=lat, lon=lon, city="delhi", category=cat, interest_tag=tag,
                       opening_hours=oh, avg_visit_minutes=visit, cost=cost, website=site,
                       image_url=img)
             db.add(p)
@@ -49,7 +49,7 @@ def seed() -> dict:
         db.flush()  # assign ids
 
         for (name, lat, lon, typ) in PARIS_AMENITIES:
-            db.add(Amenity(name=name, lat=lat, lon=lon, type=typ))
+            db.add(Amenity(name=name, lat=lat, lon=lon, city="delhi", type=typ))
 
         # pairwise travel times + straight-line route geometry (computed once)
         for a in places:

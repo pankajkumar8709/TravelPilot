@@ -43,6 +43,11 @@ class Settings(BaseSettings):
     # Auto-seed a fresh DB on first boot so the deployed app renders immediately.
     auto_seed: bool = True
 
+    # Allow live reference-data ingestion (Overpass/Nominatim) at runtime when a
+    # trip targets a city not yet in the cache. Off = strictly offline/cached
+    # behavior (tests, air-gapped demos). On = any city worldwide on demand.
+    allow_live_ingestion: bool = True
+
     # --- Currency (Phase 6) ---
     frankfurter_url: str = "https://api.frankfurter.app"
 

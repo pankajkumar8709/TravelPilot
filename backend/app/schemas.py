@@ -20,6 +20,7 @@ class TripCreate(BaseModel):
 class ChatAdd(BaseModel):
     trip_id: int
     place_query: str                 # free text, e.g. "IIT Delhi"
+    place_id: int | None = None      # exact cached place (chat explore selection)
     day_index: int | None = None     # preferred day; None = auto-pick
     lang: str = "en"
 
@@ -41,6 +42,33 @@ class ChatMessage(BaseModel):
     trip_id: int
     message: str
     lang: str = "en"
+
+
+class ChatExplore(BaseModel):
+    """'Show more places near X' — returns tappable options (not scheduled)."""
+    trip_id: int
+    near_query: str                 # free text: an activity/hotel name or a place
+    limit: int = 6
+    lang: str = "en"
+
+
+class ChatNearby(BaseModel):
+    """'What's near my hotel' — informational text answer."""
+    trip_id: int
+    reference: str = "hotel"
+    lang: str = "en"
+
+
+class ChatChangeDestination(BaseModel):
+    """'Take me to Jaipur instead' — re-resolves the city and regenerates."""
+    trip_id: int
+    destination: str
+    lang: str = "en"
+
+
+class CityPrep(BaseModel):
+    """Pre-warm the cache for a destination before POST /trips."""
+    destination: str
 
 
 class DisruptionInject(BaseModel):

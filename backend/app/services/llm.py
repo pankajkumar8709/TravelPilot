@@ -100,6 +100,8 @@ CHAT_ACTIONS = {
     "move": ["place", "to_day"],         # "move the museum to day 2"
     "shorten": ["place", "max_minutes"], # "only 2 hours at the fort"
     "nearby": ["reference"],             # "what's near my hotel / today's first stop"
+    "explore": ["place"],                # "show me more places near India Gate"
+    "change_destination": ["destination"],  # "take me to Jaipur instead"
     "question": [],                      # anything else — answer inline
 }
 
@@ -116,7 +118,13 @@ def classify_chat_action(message: str, day_count: int) -> dict:
                 f"The trip has {day_count} days. "
                 "Rules: 'add' = they want a new place (slot place = just the place name, no day words). "
                 "'move' needs to_day (1-based int). 'shorten' needs max_minutes (int). "
-                "'nearby' = they ask what's close to a reference (hotel/first stop/current). "
+                "'nearby' = a quick informational what's-close-by question. "
+                "'explore' = they want to DISCOVER more places near a landmark to potentially add "
+                "(phrases like 'show me more places near X', 'what else is there around X', "
+                "'other options near X', 'more places like X') — slot place = the landmark. "
+                "'change_destination' = they want the WHOLE trip moved to a different city "
+                "(phrases like 'take me to X instead', 'change destination to X', "
+                "'what about planning for X', 'replan in X') — slot destination = city name only. "
                 "Anything informational = 'question'. "
                 'Respond with ONLY JSON: {"action":name,"slots":{...}}. No prose.'
             )
@@ -156,7 +164,22 @@ def _mock_chat_action(message: str) -> dict:
         mins = int(m.group(1)) * 60
         name = _re.sub(r"(?:only|max|at most|no more than).*", "", q).replace("at the", "").replace("spend", "").strip()
         return {"action": "shorten", "slots": {"place": name, "max_minutes": mins}, "degraded": True}
+    m = _re.search(r"(?:show|give|list|what)\s*(?:me\s*)?(?:some\s*)?(?:more\s*)?(?:other\s*)?(?:places|options|attractions|sights|spots|things)\b.*?(?:near|around|close to|by)\s+(.+?)(?:\?|$)", q) \
+        or _re.search(r"(?:what|anything)\s+(?:else\s+)?(?:is\s+)?(?:there\s+)?(?:around|near|close to)\s+(.+?)(?:\?|$)", q) \
+        or _re.match(r"(?:more|other|explore|discover)\s+(?:places|options|attractions|spots)\s*(?:near|around|close to)?\s*(.*)", q)
+    if m:
+        place = (m.group(1) or "").strip()
+        place = _re.sub(r"\b(?:my\s+)?(hotel|current location|here)\b", "", place).strip()
+        return {"action": "explore", "slots": {"place": place}, "degraded": True}
+    m = _re.search(r"(?:take me to|change (?:the )?destination to|switch to|go to|replan? (?:my )?(?:trip )?in|what about (?:going to|planning for)|instead of)\s+(.+?)(?:\s+instead)?(?:\?|$)", q) \
+        or _re.match(r"(?:plan|replan|rebuild)\s+(?:a\s+)?(?:trip|itinerary)\s+(?:for|in|to)\s+(.+?)(?:\?|$)", q)
+    if m:
+        dest = (m.group(1) or "").strip()
+        dest = _re.sub(r"\b(?:instead|instead of this|this city|here)\b", "", dest).strip()
+        if dest:
+            return {"action": "change_destination", "slots": {"destination": dest.title()}, "degraded": True}
     if any(w in q for w in ["near", "close", "nearby", "around"]):
+        # "more places near X" already matched explore above; plain "near X" is informational
         return {"action": "nearby", "slots": {"reference": "hotel" if "hotel" in q else "first"}, "degraded": True}
     return {"action": "question", "slots": {}, "degraded": True}
 

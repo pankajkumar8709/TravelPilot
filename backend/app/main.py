@@ -24,10 +24,13 @@ from app.core.repair import repair_day
 from app.core.timeutil import to_min
 from app.db import get_db, init_db
 from app.models import Activity, Booking, Day, ItineraryChange, Place, Trip, Amenity, Suggestion, TravelTime, Route
-from app.schemas import ChatAdd, ChatMessage, ChatMove, ChatReorder, DisruptionInject, NLQuery, TripCreate
+from app.schemas import (ChatAdd, ChatChangeDestination, ChatExplore, ChatMessage,
+                         ChatMove, ChatReorder, ChatNearby, CityPrep, DisruptionInject,
+                         NLQuery, TripCreate)
 from app.services import llm
 from app.services.trip_service import generate_trip
 from app.services import ors as ors_service
+from app.services import city as city_service
 
 app = FastAPI(title="TravelPilot", version="1.0")
 app.add_middleware(
@@ -75,16 +78,31 @@ def amenities(db: Session = Depends(get_db)):
             for a in db.query(Amenity).all()]
 
 
+@app.post("/cities/prep")
+def cities_prep(body: CityPrep, db: Session = Depends(get_db)):
+    """Pre-warm the reference cache for any destination (any city in India or
+    worldwide). Idempotent and cheap when already cached; one-time Overpass
+    fetch otherwise. Returns the resolved city slug + place count."""
+    slug = city_service.ensure_city(db, body.destination)
+    count = db.query(Place).filter(Place.city == slug).count()
+    return {"city": slug, "places": count, "ready": count > 0}
+
+
 @app.post("/trips")
 def create_trip(body: TripCreate, db: Session = Depends(get_db)):
+    # Resolve the destination to a plannable city (cached or fetched once).
+    slug = city_service.ensure_city(db, body.destination)
     trip = Trip(destination=body.destination, start_date=body.start_date, end_date=body.end_date,
                 budget_total=body.budget_total, currency=body.currency, interests=body.interests,
                 hotel_place_id=body.hotel_place_id, start_time_day1=body.start_time_day1,
-                pace=body.pace, group_size=body.group_size)
+                pace=body.pace, group_size=body.group_size, city=slug)
     db.add(trip)
     db.commit()
     db.refresh(trip)
-    generate_trip(db, trip)
+    try:
+        generate_trip(db, trip)
+    except ValueError as e:
+        raise HTTPException(422, str(e))
     return get_trip(trip.id, db)
 
 
@@ -99,6 +117,7 @@ def get_trip(trip_id: int, db: Session = Depends(get_db)):
         "start_date": trip.start_date, "end_date": trip.end_date,
         "budget_total": trip.budget_total, "currency": trip.currency,
         "interests": trip.interests, "hotel_place_id": trip.hotel_place_id,
+        "city": trip.city,
         "days": [_day_dict(db, d) for d in days],
         "pending_changes": [_change_dict(c) for c in
                             db.query(ItineraryChange).filter_by(trip_id=trip_id, status="pending").all()],
@@ -147,7 +166,7 @@ def inject_disruption(body: DisruptionInject, db: Session = Depends(get_db)):
             return 0.0
         return tmap.get((a, b), tmap.get((b, a), 20.0))
 
-    candidates = _schedulable_candidates(db)
+    candidates = _schedulable_candidates(db, trip)
     n_days = len(db.query(Day).filter_by(trip_id=trip.id).all())
     day_budget = (trip.budget_total / n_days) if trip.budget_total else 1e9
 
@@ -289,18 +308,24 @@ def chat_add(body: ChatAdd, db: Session = Depends(get_db)):
     if not trip:
         raise HTTPException(404, "trip not found")
 
-    # 1) resolve: prefer an existing cached place by name, else geocode a new one
+    # 1) resolve: an exact place_id wins (chat explore selection); else name
+    # match within the trip's city; else geocode a brand-new place
     ql = body.place_query.strip().lower()
-    place = next((p for p in db.query(Place).all() if ql in p.name.lower()), None)
+    city_q = db.query(Place).filter(Place.city == trip.city) if trip.city else db.query(Place)
+    place = None
+    if body.place_id:
+        place = db.get(Place, body.place_id)
+    if place is None:
+        place = next((p for p in city_q.all() if ql in p.name.lower()), None)
     if place is None:
         from app.services.geocode import geocode
         from app.services.images import image_for
         g = geocode(body.place_query, near_city=trip.destination)
         if not g:
             raise HTTPException(422, f"Could not resolve a place named '{body.place_query}'.")
-        place = Place(name=g["name"], lat=g["lat"], lon=g["lon"], category="culture",
-                      interest_tag="culture", opening_hours="", avg_visit_minutes=60,
-                      cost=0.0, website="", image_url=image_for(g["name"]))
+        place = Place(name=g["name"], lat=g["lat"], lon=g["lon"], city=trip.city or "",
+                      category="culture", interest_tag="culture", opening_hours="",
+                      avg_visit_minutes=60, cost=0.0, website="", image_url=image_for(g["name"]))
         db.add(place)
         db.flush()
         # add travel times from this new place to all others (haversine estimate)
@@ -459,6 +484,84 @@ def share_trip(trip_id: int, db: Session = Depends(get_db)):
     return {"share_id": f"trip-{trip_id}", "read_only": True, "trip": get_trip(trip_id, db)}
 
 
+@app.post("/chat/explore")
+def chat_explore(body: ChatExplore, db: Session = Depends(get_db)):
+    """'Show more places near X' — returns ranked, TAPPABLE options (never
+    scheduled directly). Cached places first; if the cache is thin, tops up
+    from Overpass once (same one-time ingestion as any new city)."""
+    trip = db.get(Trip, body.trip_id)
+    if not trip:
+        raise HTTPException(404, "trip not found")
+
+    nl = body.near_query.strip().lower()
+    scope = db.query(Place)
+    if trip.city:
+        scope = scope.filter(Place.city == trip.city)
+
+    # anchor: match an existing place/activity by name, else fall back to the hotel
+    anchor = None
+    if nl:
+        anchor = next((p for p in scope.all() if nl in p.name.lower()), None)
+        if anchor is None:
+            act = db.query(Activity).join(Day).filter(Day.trip_id == trip.id) \
+                     .filter(Activity.name.ilike(f"%{body.near_query.strip()}%")).first()
+            if act:
+                anchor = db.get(Place, act.place_id)
+    if anchor is None:
+        anchor = db.get(Place, trip.hotel_place_id) if trip.hotel_place_id else \
+            scope.first()
+    if anchor is None:
+        raise HTTPException(422, "Nothing to search near yet — add a place or an activity first.")
+
+    in_plan = {a.place_id for a in db.query(Activity).join(Day)
+               .filter(Day.trip_id == trip.id).all()}
+    options = city_service.nearby(db, trip.city or "", anchor.lat, anchor.lon,
+                                  radius_km=8.0, limit=body.limit,
+                                  exclude_ids=tuple(in_plan))
+
+    # thin cache -> one-time Overpass top-up around the anchor, then re-query
+    if len(options) < 3 and settings.allow_live_ingestion and trip.city:
+        try:
+            city_service._seed_city_rows(db, trip.city, anchor.lat, anchor.lon,
+                                         radius_m=4000, max_places=24)
+            in_plan = {a.place_id for a in db.query(Activity).join(Day)
+                       .filter(Day.trip_id == trip.id).all()}
+            options = city_service.nearby(db, trip.city, anchor.lat, anchor.lon,
+                                          radius_km=8.0, limit=body.limit,
+                                          exclude_ids=tuple(in_plan))
+        except Exception:
+            db.rollback()  # offline: cached options (possibly none) are still returned
+
+    return {
+        "near": anchor.name,
+        "options": options,
+        "note": "" if options else
+        "Nothing new found nearby — try another landmark or check back once the city data is cached.",
+    }
+
+
+@app.post("/chat/change-destination")
+def chat_change_destination(body: ChatChangeDestination, db: Session = Depends(get_db)):
+    """'Take me to Jaipur instead' — resolves (and if needed ingests) the new
+    city, then regenerates the SAME trip in place. Deliberately immediate:
+    the old plan is replaced, no pending diff, because every activity changes."""
+    trip = db.get(Trip, body.trip_id)
+    if not trip:
+        raise HTTPException(404, "trip not found")
+    slug = city_service.ensure_city(db, body.destination)
+    if not db.query(Place).filter(Place.city == slug).count():
+        raise HTTPException(422,
+            f"Couldn't fetch plans for '{body.destination}' right now — try again in a moment.")
+    trip.destination = body.destination
+    trip.city = slug
+    trip.hotel_place_id = None  # stale hotel from the old city
+    db.commit()
+    db.refresh(trip)
+    generate_trip(db, trip)
+    db.refresh(trip)
+    return {"status": "regenerated", "city": slug, "trip": get_trip(trip.id, db)}
+
+
 @app.post("/chat")
 def chat(body: ChatMessage, db: Session = Depends(get_db)):
     """Unified conversational endpoint. Groq (or mock) classifies the free-form
@@ -479,6 +582,21 @@ def chat(body: ChatMessage, db: Session = Depends(get_db)):
                  .filter(Activity.name.ilike(f"%{name}%")).first() \
             or next((a for a in db.query(Activity).join(Day).filter(Day.trip_id == trip.id).all()
                      if nl in a.name.lower()), None)
+
+    if action == "explore":
+        return {"kind": "options", **chat_explore(
+            ChatExplore(trip_id=trip.id, near_query=slots.get("place") or slots.get("reference", ""),
+                        lang=body.lang), db)}
+
+    if action == "change_destination":
+        dest = slots.get("destination", "")
+        if not dest:
+            return {"kind": "answer", "text": "Where would you like to go instead? Name a city and I'll rebuild the plan there."}
+        try:
+            return {"kind": "regenerated", **chat_change_destination(
+                ChatChangeDestination(trip_id=trip.id, destination=dest, lang=body.lang), db)}
+        except HTTPException as e:
+            return {"kind": "answer", "text": str(e.detail)}
 
     if action == "add":
         return {"kind": "diff", "change": chat_add(
@@ -522,17 +640,9 @@ def chat(body: ChatMessage, db: Session = Depends(get_db)):
         return {"kind": "diff", "change": _change_dict(change)}
 
     if action == "nearby":
-        ref = slots.get("reference", "hotel")
-        tmap = {(t.from_id, t.to_id): t.duration_minutes for t in db.query(TravelTime).all()}
-        if ref == "hotel" and trip.hotel_place_id:
-            anchor = trip.hotel_place_id
-        else:
-            first = db.query(Activity).join(Day).filter(Day.trip_id == trip.id).order_by(Day.day_index, Activity.seq).first()
-            anchor = first.place_id if first else trip.hotel_place_id
-        cands = [p for p in db.query(Place).all() if p.category in ("food", "culture", "outdoor", "history", "shopping")]
-        ranked = sorted(cands, key=lambda p: tmap.get((anchor, p.id), 999))[:4]
-        summary = "Closest options: " + ", ".join(f"{p.name} (~{tmap.get((anchor, p.id), 0):.0f} min)" for p in ranked)
-        return {"kind": "answer", "text": llm.phrase(summary, lang=body.lang)}
+        return {"kind": "answer", "text": llm.phrase(nearby_summary(
+            ChatNearby(trip_id=trip.id, reference=slots.get("reference", "hotel"), lang=body.lang), db),
+            lang=body.lang)}
 
     # question
     parsedq = llm.classify_intent(body.message)
@@ -576,6 +686,30 @@ def nl_query(body: NLQuery, db: Session = Depends(get_db)):
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
+def nearby_summary(body: ChatNearby, db: Session) -> str:
+    """Informational 'what's near X' text (shared by /chat nearby + tests)."""
+    trip = db.get(Trip, body.trip_id)
+    if not trip:
+        return "Trip not found."
+    tmap = {(t.from_id, t.to_id): t.duration_minutes for t in db.query(TravelTime).all()}
+    if body.reference == "hotel" and trip.hotel_place_id:
+        anchor = trip.hotel_place_id
+    else:
+        first = db.query(Activity).join(Day).filter(Day.trip_id == trip.id) \
+                 .order_by(Day.day_index, Activity.seq).first()
+        anchor = first.place_id if first else trip.hotel_place_id
+    scope = db.query(Place)
+    if trip.city:
+        scope = scope.filter(Place.city == trip.city)
+    cands = [p for p in scope.all()
+             if p.category in ("food", "culture", "outdoor", "history", "shopping")]
+    ranked = sorted(cands, key=lambda p: tmap.get((anchor, p.id), 999))[:4]
+    if not ranked:
+        return "Nothing cached nearby yet — try 'show me places near <landmark>'."
+    return "Closest options: " + ", ".join(
+        f"{p.name} (~{tmap.get((anchor, p.id), 0):.0f} min)" for p in ranked)
+
+
 def _place_dict(p: Place):
     return {"id": p.id, "name": p.name, "lat": p.lat, "lon": p.lon, "category": p.category,
             "interest_tag": p.interest_tag, "opening_hours": p.opening_hours,
@@ -609,9 +743,9 @@ def _to_planned(a: Activity) -> PlannedActivity:
                            backups=a.backups or [])
 
 
-def _schedulable_candidates(db: Session):
+def _schedulable_candidates(db: Session, trip: Trip | None = None):
     from app.services.trip_service import SCHEDULABLE, _candidates
-    return [c for c in _candidates(db) if c.category in SCHEDULABLE]
+    return [c for c in _candidates(db, trip.city if trip else None) if c.category in SCHEDULABLE]
 
 
 def _default_reason(trigger: str, planned, disrupted_id: int) -> str:
