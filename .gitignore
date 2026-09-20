@@ -1,0 +1,31 @@
+# --- secrets / env (NEVER commit) ---
+.env
+*.env
+!.env.example
+.aws/
+*.pem
+
+
+.kiro
+# --- python ---
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+*.db
+travelpilot.db
+
+# --- node / frontend ---
+node_modules/
+web/dist/
+web/.vite/
+
+# --- aws sam ---
+.aws-sam/
+infra/lambda/**/__pycache__/
+
+# --- os / editor ---
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

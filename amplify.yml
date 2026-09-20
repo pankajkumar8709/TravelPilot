@@ -1,0 +1,21 @@
+# AWS Amplify Hosting build spec (Phase 0). Place at repo root or point Amplify
+# app root to /web. Set VITE_API_BASE in the Amplify console env vars to your
+# App Runner service URL (e.g. https://xxxx.us-east-1.awsapprunner.com).
+version: 1
+applications:
+  - appRoot: web
+    frontend:
+      phases:
+        preBuild:
+          commands:
+            - npm ci
+        build:
+          commands:
+            - npm run build
+      artifacts:
+        baseDirectory: dist
+        files:
+          - "**/*"
+      cache:
+        paths:
+          - node_modules/**/*

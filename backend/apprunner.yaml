@@ -1,0 +1,22 @@
+# AWS App Runner config (Phase 0). Used for source-based (non-Docker) deploys;
+# the Dockerfile path is the alternative. Choose ONE in the App Runner console.
+version: 1.0
+runtime: python3
+build:
+  commands:
+    build:
+      - pip install -r requirements.txt
+run:
+  runtime-version: 3.12
+  command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+  network:
+    port: 8000
+  env:
+    # Set the real values as App Runner service env vars / Secrets Manager refs.
+    # DATABASE_URL      -> postgresql+psycopg2://USER:PASS@RDS_HOST:5432/travelpilot
+    # USE_MOCK_LLM      -> false   (once Bedrock model access is confirmed)
+    # BEDROCK_MODEL_ID  -> anthropic.claude-3-5-sonnet-20240620-v1:0
+    # AWS_REGION_NAME   -> your region (NOT reserved AWS_REGION)
+    # CORS_ORIGINS      -> your Amplify origin, e.g. https://main.xxxx.amplifyapp.com
+    - name: PORT
+      value: "8000"

@@ -1,0 +1,68 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  TravelPilot disruption pipeline (Phase 0 plumbing + Phase 7).
+  EventBridge (scheduled poll) -> SQS -> Lambda -> repair pipeline.
+  Deploy: cd infra && sam build && sam deploy --guided
+
+Parameters:
+  ApiBaseUrl:
+    Type: String
+    Default: ""
+    Description: App Runner backend base URL the Lambda calls to run the repair (Phase 7).
+
+Resources:
+  DisruptionQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: travelpilot-disruptions
+      VisibilityTimeout: 60
+
+  # Phase 0: prove a test event flows end to end. Phase 7: real scheduled poll.
+  PollRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: travelpilot-disruption-poll
+      ScheduleExpression: "rate(15 minutes)"
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt DisruptionQueue.Arn
+          Id: disruption-queue
+
+  QueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref DisruptionQueue]
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: { Service: events.amazonaws.com }
+            Action: sqs:SendMessage
+            Resource: !GetAtt DisruptionQueue.Arn
+            Condition:
+              ArnEquals: { aws:SourceArn: !GetAtt PollRule.Arn }
+
+  DisruptionFn:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: travelpilot-disruption-worker
+      Runtime: python3.12
+      Handler: handler.handler
+      CodeUri: lambda/
+      Timeout: 60
+      MemorySize: 256
+      Environment:
+        Variables:
+          API_BASE_URL: !Ref ApiBaseUrl
+      Events:
+        FromQueue:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt DisruptionQueue.Arn
+            BatchSize: 1
+
+Outputs:
+  QueueUrl:
+    Value: !Ref DisruptionQueue
+  FunctionName:
+    Value: !Ref DisruptionFn
