@@ -52,7 +52,14 @@ export function ChatPanel({
     try {
       // One server-side router (Groq, or keyword mock offline) classifies the
       // message and executes the matching handler — the browser never guesses.
-      const r = await api.chat({ trip_id: trip.id, message: text, lang });
+      // Recent turns ride along so follow-ups ('add that one') land in context.
+      const history = msgs.slice(-6).map((m) => ({
+        role: m.role === "user" ? "user" : "bot",
+        content: m.role === "options" ? `More places near ${m.near}`
+          : m.role === "diff" ? `Queued: ${m.change.reason}`
+          : m.text,
+      }));
+      const r = await api.chat({ trip_id: trip.id, message: text, lang, history });
       if (r.kind === "diff") {
         push({ role: "diff", change: r.change });
       } else if (r.kind === "options") {

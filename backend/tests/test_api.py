@@ -58,9 +58,10 @@ def test_full_flow(client):
     # places seeded
     assert len(client.get("/places").json()) > 0
 
-    # create + generate a 2-day Paris trip
+    # create + generate a 2-day trip in the seeded default city (tests are
+    # hermetic — live ingestion is off, so unknown cities now fail honestly)
     trip = client.post("/trips", json={
-        "destination": "Paris", "start_date": "2026-09-25", "end_date": "2026-09-26",
+        "destination": "Delhi", "start_date": "2026-09-25", "end_date": "2026-09-26",
         "budget_total": 300, "currency": "EUR", "interests": ["culture", "history", "food"],
     }).json()
     assert len(trip["days"]) == 2
@@ -193,15 +194,23 @@ def test_chat_explore_and_add_flow(client_offline):
 
 
 def test_offline_unknown_city_falls_back(client_offline):
-    """ALLOW_LIVE_INGESTION=false: an unknown city falls back to the seeded one
-    instead of attempting a live fetch — generation still succeeds."""
+    """ALLOW_LIVE_INGESTION=false: an unknown city fails HONESTLY (422 with a
+    user-safe message) instead of silently rebuilding the trip in the wrong
+    city — the silent Delhi fallback was a correctness trap in chat."""
     c = client_offline
     r = c.post("/trips", json={
         "destination": "Nowhereland", "start_date": "2026-09-25", "end_date": "2026-09-26",
         "budget_total": 300, "currency": "INR", "interests": ["history"],
     })
-    assert r.status_code == 200, "offline fallback must keep generation working"
-    assert len(r.json()["days"]) == 2
+    assert r.status_code == 422, "unknown city must fail honestly, not fall back silently"
+    assert "nowhereland" in r.json()["detail"].lower()
+    # ...but the seeded default city still works fully offline
+    r2 = c.post("/trips", json={
+        "destination": "Delhi", "start_date": "2026-09-25", "end_date": "2026-09-26",
+        "budget_total": 300, "currency": "INR", "interests": ["history"],
+    })
+    assert r2.status_code == 200, "seeded default city must generate offline"
+    assert len(r2.json()["days"]) == 2
 
 
 def test_mock_classifier_routes_new_actions():

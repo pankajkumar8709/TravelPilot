@@ -170,7 +170,7 @@ export const api = {
     fetch(`${BASE}/nl/query`, {
       method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
     }).then(j<{ intent: string; slots: Record<string, string>; answer: string; degraded: boolean }>),
-  chat: (body: { trip_id: number; message: string; lang?: string }) =>
+  chat: (body: { trip_id: number; message: string; lang?: string; history?: { role: string; content: string }[] }) =>
     fetch(`${BASE}/chat`, {
       method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
     }).then(j<ChatReply>),

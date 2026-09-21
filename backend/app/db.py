@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 from sqlalchemy import create_engine
+from sqlalchemy.exc import OperationalError
+from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.config import settings
@@ -18,8 +20,29 @@ SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 
 
 def init_db() -> None:
-    Base.metadata.create_all(bind=engine)
+    try:
+        Base.metadata.create_all(bind=engine)
+    except OperationalError as e:
+        # Fail with a short, actionable message instead of the raw SQLAlchemy
+        # traceback — a blocked RDS security group looks identical to a typo'd host.
+        raise RuntimeError(_unreachable_message()) from e
     _add_missing_columns()
+
+
+def _unreachable_message() -> str:
+    url = make_url(settings.database_url)
+    host = url.host or "?"
+    port = url.port or 5432
+    return (
+        f"Cannot reach the database at {host}:{port}. "
+        "If this is the RDS host from a laptop, check in the AWS console: "
+        "(1) the instance is Publicly accessible = Yes, "
+        "(2) its security group allows inbound TCP 5432 from your current IP "
+        "(your IP changes often — re-check it), and "
+        "(3) no VPN/corporate firewall is blocking outbound 5432. "
+        "For local development you can instead clear DATABASE_URL in backend/.env "
+        "to use the SQLite fallback."
+    )
 
 
 # Additive, idempotent column migration: create_all() makes missing TABLES but

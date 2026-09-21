@@ -83,7 +83,10 @@ def cities_prep(body: CityPrep, db: Session = Depends(get_db)):
     """Pre-warm the reference cache for any destination (any city in India or
     worldwide). Idempotent and cheap when already cached; one-time Overpass
     fetch otherwise. Returns the resolved city slug + place count."""
-    slug = city_service.ensure_city(db, body.destination)
+    try:
+        slug = city_service.ensure_city(db, body.destination)
+    except RuntimeError as e:
+        raise HTTPException(422, str(e))
     count = db.query(Place).filter(Place.city == slug).count()
     return {"city": slug, "places": count, "ready": count > 0}
 
@@ -91,17 +94,29 @@ def cities_prep(body: CityPrep, db: Session = Depends(get_db)):
 @app.post("/trips")
 def create_trip(body: TripCreate, db: Session = Depends(get_db)):
     # Resolve the destination to a plannable city (cached or fetched once).
-    slug = city_service.ensure_city(db, body.destination)
+    try:
+        slug = city_service.ensure_city(db, body.destination)
+    except RuntimeError as e:
+        raise HTTPException(422, str(e))
     trip = Trip(destination=body.destination, start_date=body.start_date, end_date=body.end_date,
                 budget_total=body.budget_total, currency=body.currency, interests=body.interests,
                 hotel_place_id=body.hotel_place_id, start_time_day1=body.start_time_day1,
                 pace=body.pace, group_size=body.group_size, city=slug)
+    if trip.hotel_place_id is None:
+        # default stay: first cached hotel of the city (chat 'near my hotel',
+        # stay suggestions and day-1 routing all anchor here)
+        h = city_service._hotel(db, slug)
+        if h:
+            trip.hotel_place_id = h.id
     db.add(trip)
     db.commit()
     db.refresh(trip)
     try:
         generate_trip(db, trip)
     except ValueError as e:
+        db.rollback()
+        db.delete(trip)
+        db.commit()
         raise HTTPException(422, str(e))
     return get_trip(trip.id, db)
 
@@ -309,28 +324,56 @@ def chat_add(body: ChatAdd, db: Session = Depends(get_db)):
         raise HTTPException(404, "trip not found")
 
     # 1) resolve: an exact place_id wins (chat explore selection); else name
-    # match within the trip's city; else geocode a brand-new place
+    # match within the trip's city; else a category word ('museum', 'park',
+    # 'temple'...) matches a real cached place; else geocode a brand-new place
     ql = body.place_query.strip().lower()
     city_q = db.query(Place).filter(Place.city == trip.city) if trip.city else db.query(Place)
     place = None
+    import re as _re
+    from app.services.city import CATEGORY_WORDS
+    # GENERIC only when the query IS a category word ("a museum" -> "museum"):
+    # "Rock Garden" contains 'garden' but names a specific place, so it must
+    # fall through to name matching / geocoding instead
+    stripped = _re.sub(r"^(?:a|an|the|some|one)\s+", "", ql).strip()
+    is_generic = stripped in CATEGORY_WORDS
     if body.place_id:
         place = db.get(Place, body.place_id)
-    if place is None:
+    if place is None and not is_generic:
         place = next((p for p in city_q.all() if ql in p.name.lower()), None)
+    hotel = db.get(Place, trip.hotel_place_id) if trip.hotel_place_id else None
+    if place is None and is_generic:
+        # "add a museum" / "add a park" — pick a real cached place of that kind
+        # (nearest the hotel, not already planned) instead of geocoding nonsense
+        planned_ids = {a.place_id for a in db.query(Activity).join(Day)
+                       .filter(Day.trip_id == trip.id).all()}
+        cat = CATEGORY_WORDS[stripped]
+        cands = [p for p in city_q.filter(Place.category == cat).all()
+                 if p.id not in planned_ids]
+        if cands:
+            ref = hotel or cands[0]
+            place = min(cands, key=lambda p: _haversine_km(p.lat, p.lon, ref.lat, ref.lon))
+        else:
+            raise HTTPException(422,
+                f"No unplanned {cat} spots left in the cached data for this city — "
+                "try 'show me places near <landmark>' to discover more.")
     if place is None:
         from app.services.geocode import geocode
         from app.services.images import image_for
-        g = geocode(body.place_query, near_city=trip.destination)
+        g = geocode(body.place_query, near_city=trip.destination,
+                    near_lat=hotel.lat if hotel else None,
+                    near_lon=hotel.lon if hotel else None)
         if not g:
             raise HTTPException(422, f"Could not resolve a place named '{body.place_query}'.")
+        # categorize from the name so a geocoded 'Nucleus Mall' is shopping, not culture
+        cat = next((c for w, c in CATEGORY_WORDS.items() if w in g["name"].lower()), "culture")
         place = Place(name=g["name"], lat=g["lat"], lon=g["lon"], city=trip.city or "",
-                      category="culture", interest_tag="culture", opening_hours="",
+                      category=cat, interest_tag=cat, opening_hours="",
                       avg_visit_minutes=60, cost=0.0, website="", image_url=image_for(g["name"]))
         db.add(place)
         db.flush()
-        # add travel times from this new place to all others (haversine estimate)
+        # add travel times from this new place to same-city others (haversine estimate)
         import math
-        for other in db.query(Place).all():
+        for other in db.query(Place).filter(Place.city == trip.city).all() if trip.city else db.query(Place).all():
             if other.id == place.id:
                 continue
             km = _haversine_km(place.lat, place.lon, other.lat, other.lon)
@@ -339,14 +382,36 @@ def chat_add(body: ChatAdd, db: Session = Depends(get_db)):
             db.add(TravelTime(from_id=other.id, to_id=place.id, duration_minutes=mins, mode="foot-walking"))
         db.commit()
 
-    # 2) pick the day: requested, else the day with the earliest free slot (fewest activities)
+    # no duplicates: the place may already be on the itinerary
+    already = db.query(Activity).join(Day).filter(Day.trip_id == trip.id,
+                                                  Activity.place_id == place.id).first()
+    if already:
+        raise HTTPException(422,
+            f"'{place.name}' is already in your plan on day {already.day.day_index} "
+            f"({already.start_time}).")
+
+    # 2) pick the day: requested, else the first day where appending the place
+    # stays inside the day's window (fewest activities as tie-break), else the
+    # least-loaded day (validator will flag the overrun for review)
+    from app.core.timeutil import to_min
     days = db.query(Day).filter_by(trip_id=trip.id).order_by(Day.day_index).all()
     if not days:
         raise HTTPException(400, "trip has no days")
     if body.day_index:
         target = next((d for d in days if d.day_index == body.day_index), days[0])
     else:
-        target = min(days, key=lambda d: db.query(Activity).filter_by(day_id=d.id).count())
+        def append_finish(d: Day) -> int:
+            acts_d = db.query(Activity).filter_by(day_id=d.id).order_by(Activity.seq).all()
+            if not acts_d:
+                return to_min(d.start_time) + place.avg_visit_minutes
+            last = acts_d[-1]
+            tt = db.query(TravelTime).filter_by(from_id=last.place_id, to_id=place.id).first() \
+                or db.query(TravelTime).filter_by(from_id=place.id, to_id=last.place_id).first()
+            travel = tt.duration_minutes if tt else 20.0
+            return to_min(last.end_time) + travel + place.avg_visit_minutes
+        fitting = [d for d in days if append_finish(d) <= to_min(d.end_time)]
+        target = min(fitting or days,
+                     key=lambda d: db.query(Activity).filter_by(day_id=d.id).count())
 
     # 3) build the proposed day = existing activities + the new place appended, re-timed
     acts = db.query(Activity).filter_by(day_id=target.id).order_by(Activity.seq).all()
@@ -498,9 +563,12 @@ def chat_explore(body: ChatExplore, db: Session = Depends(get_db)):
     if trip.city:
         scope = scope.filter(Place.city == trip.city)
 
-    # anchor: match an existing place/activity by name, else fall back to the hotel
+    # anchor: match an existing place/activity by name; 'my hotel' or no match
+    # falls back to the hotel (cached hotel, else day-1's first stop as the
+    # practical center of the trip), never an arbitrary place
+    wants_hotel = not nl or "hotel" in nl or "here" in nl or "current location" in nl
     anchor = None
-    if nl:
+    if nl and not wants_hotel:
         anchor = next((p for p in scope.all() if nl in p.name.lower()), None)
         if anchor is None:
             act = db.query(Activity).join(Day).filter(Day.trip_id == trip.id) \
@@ -508,8 +576,15 @@ def chat_explore(body: ChatExplore, db: Session = Depends(get_db)):
             if act:
                 anchor = db.get(Place, act.place_id)
     if anchor is None:
-        anchor = db.get(Place, trip.hotel_place_id) if trip.hotel_place_id else \
-            scope.first()
+        anchor = db.get(Place, trip.hotel_place_id) if trip.hotel_place_id else None
+    if anchor is None:
+        anchor = city_service._hotel(db, trip.city or "")
+    if anchor is None:
+        first = db.query(Activity).join(Day).filter(Day.trip_id == trip.id) \
+            .order_by(Day.day_index, Activity.seq).first()
+        anchor = db.get(Place, first.place_id) if first else None
+    if anchor is None:
+        anchor = scope.first()
     if anchor is None:
         raise HTTPException(422, "Nothing to search near yet — add a place or an activity first.")
 
@@ -519,7 +594,7 @@ def chat_explore(body: ChatExplore, db: Session = Depends(get_db)):
                                   radius_km=8.0, limit=body.limit,
                                   exclude_ids=tuple(in_plan))
 
-    # thin cache -> one-time Overpass top-up around the anchor, then re-query
+    # thin cache -> one-time top-up around the anchor, then re-query
     if len(options) < 3 and settings.allow_live_ingestion and trip.city:
         try:
             city_service._seed_city_rows(db, trip.city, anchor.lat, anchor.lon,
@@ -548,13 +623,18 @@ def chat_change_destination(body: ChatChangeDestination, db: Session = Depends(g
     trip = db.get(Trip, body.trip_id)
     if not trip:
         raise HTTPException(404, "trip not found")
-    slug = city_service.ensure_city(db, body.destination)
+    try:
+        slug = city_service.ensure_city(db, body.destination)
+    except RuntimeError as e:
+        raise HTTPException(422, str(e))
     if not db.query(Place).filter(Place.city == slug).count():
         raise HTTPException(422,
             f"Couldn't fetch plans for '{body.destination}' right now — try again in a moment.")
     trip.destination = body.destination
     trip.city = slug
-    trip.hotel_place_id = None  # stale hotel from the old city
+    # stale hotel from the old city -> default stay of the new one
+    h = city_service._hotel(db, slug)
+    trip.hotel_place_id = h.id if h else None
     db.commit()
     db.refresh(trip)
     generate_trip(db, trip)
@@ -562,17 +642,53 @@ def chat_change_destination(body: ChatChangeDestination, db: Session = Depends(g
     return {"status": "regenerated", "city": slug, "trip": get_trip(trip.id, db)}
 
 
+class ChatTurn:
+    """One turn of chat, remembered per trip so follow-ups ('add that one',
+    a bare 'Nucleus mall') resolve against what was last discussed."""
+    last_options: dict[int, list[dict]] = {}
+    history: dict[int, list[dict]] = {}
+
+    MAX_TURNS = 8
+
+    @classmethod
+    def remember(cls, trip_id: int, role: str, content: str, meta: str = "") -> None:
+        h = cls.history.setdefault(trip_id, [])
+        h.append({"role": role, "content": content[:300], "meta": meta})
+        del h[:-cls.MAX_TURNS]
+
+    @classmethod
+    def snapshot(cls, trip_id: int) -> list[dict]:
+        return [{"role": m["role"], "content": m["content"], "meta": m["meta"]}
+                for m in cls.history.get(trip_id, [])]
+
+
 @app.post("/chat")
 def chat(body: ChatMessage, db: Session = Depends(get_db)):
     """Unified conversational endpoint. Groq (or mock) classifies the free-form
     message into an action, then a deterministic handler executes it. Returns
-    {kind:'diff', change} for edits (pending, needs confirm) or {kind:'answer', text}."""
+    {kind:'diff', change} for edits (pending, needs confirm) or {kind:'answer', text}.
+    The last few turns are remembered server-side per trip, so the classifier
+    can resolve conversational references ('add that one', a bare place name)."""
     trip = db.get(Trip, body.trip_id)
     if not trip:
         raise HTTPException(404, "trip not found")
     days = db.query(Day).filter_by(trip_id=trip.id).order_by(Day.day_index).all()
-    parsed = llm.classify_chat_action(body.message, len(days))
+    history = ChatTurn.snapshot(trip.id)
+    parsed = llm.classify_chat_action(body.message, len(days), history=history)
     action, slots = parsed["action"], parsed.get("slots", {})
+    ChatTurn.remember(trip.id, "user", body.message)
+
+    # Bare place mention ('Nucleus mall', 'IIIT Ranchi') — a short message with
+    # no '?' and no question starter is 'I want to go there', whatever the
+    # classifier guessed. In a trip-planning chat this is the safe reading.
+    if action == "question" and not body.message.strip().endswith("?"):
+        words = body.message.strip().split()
+        starters = {"what", "where", "when", "why", "how", "who", "is", "are", "can",
+                    "could", "do", "does", "did", "show", "tell", "list", "give",
+                    "hi", "hello", "hey", "thanks", "thank", "ok", "okay", "pls", "please"}
+        if 1 <= len(words) <= 5 and words[0].lower() not in starters \
+                and len(body.message.strip()) >= 4:
+            action, slots = "resolve", {"place": body.message.strip().title()}
 
     def _find_activity(name: str):
         if not name:
@@ -584,24 +700,89 @@ def chat(body: ChatMessage, db: Session = Depends(get_db)):
                      if nl in a.name.lower()), None)
 
     if action == "explore":
-        return {"kind": "options", **chat_explore(
+        out = {"kind": "options", **chat_explore(
             ChatExplore(trip_id=trip.id, near_query=slots.get("place") or slots.get("reference", ""),
                         lang=body.lang), db)}
+        ChatTurn.last_options[trip.id] = out.get("options", [])
+        ChatTurn.remember(trip.id, "bot",
+                          f"More places near {out.get('near', '')}: " +
+                          ", ".join(o["name"] for o in out.get("options", [])[:6]),
+                          meta="options")
+        return out
+
+    if action == "resolve":
+        # follow-up on the last explore: 'add that one', 'the second one', or
+        # a bare place name from that option list
+        opts = ChatTurn.last_options.get(trip.id, [])
+        choice = slots.get("choice")
+        place_name = slots.get("place", "")
+        picked = None
+        if isinstance(choice, int) and 1 <= choice <= len(opts):
+            picked = opts[choice - 1]
+        elif place_name:
+            pl = place_name.lower()
+            picked = next((o for o in opts
+                           if pl in o["name"].lower() or o["name"].lower() in pl), None)
+        if picked:
+            try:
+                change = chat_add(ChatAdd(trip_id=trip.id, place_query=picked["name"],
+                                          place_id=picked["place_id"], lang=body.lang), db)
+                ChatTurn.remember(trip.id, "bot", f"Queued {picked['name']} — confirm to add it.")
+                return {"kind": "diff", "change": change}
+            except HTTPException as e:
+                return {"kind": "answer", "text": str(e.detail)}
+        # no matching options in memory: fall through to a normal add (named path)
+        if place_name:
+            try:
+                return {"kind": "diff", "change": chat_add(
+                    ChatAdd(trip_id=trip.id, place_query=place_name, lang=body.lang), db)}
+            except HTTPException as e:
+                return {"kind": "answer", "text": str(e.detail)}
+        return {"kind": "answer",
+                "text": "Which place would you like to add? Name it, or ask me to show places near a landmark first."}
 
     if action == "change_destination":
         dest = slots.get("destination", "")
         if not dest:
             return {"kind": "answer", "text": "Where would you like to go instead? Name a city and I'll rebuild the plan there."}
         try:
-            return {"kind": "regenerated", **chat_change_destination(
+            out = {"kind": "regenerated", **chat_change_destination(
                 ChatChangeDestination(trip_id=trip.id, destination=dest, lang=body.lang), db)}
+            ChatTurn.remember(trip.id, "bot",
+                              f"Plan rebuilt for {out['trip']['destination']}.")
+            return out
         except HTTPException as e:
             return {"kind": "answer", "text": str(e.detail)}
+        except RuntimeError as e:
+            return {"kind": "answer", "text": str(e)}
+
+    # 'add the first one' / 'add that one' — referential phrases must resolve
+    # against the last offered options, never geocode a literal 'First One'
+    if action == "add":
+        pl = (slots.get("place") or "").lower().strip()
+        import re as _re2
+        m_ref = _re2.match(r"^(?:the\s+)?(first|second|third|fourth|1st|2nd|3rd|4th|\d)(?:\s+one)?$", pl) \
+            or (pl in ("that one", "this one", "that place", "it", "them", "both") and _re2.match(r"^(that|this|it)", pl))
+        if m_ref:
+            word = m_ref.group(1) if m_ref.group(1) else None
+            idx = {"first": 1, "1st": 1, "second": 2, "2nd": 2, "third": 3, "3rd": 3,
+                   "fourth": 4, "4th": 4}.get(word) if word else None
+            if idx is None and word and word.isdigit():
+                idx = int(word)
+            action, slots = "resolve", {"choice": idx}
 
     if action == "add":
-        return {"kind": "diff", "change": chat_add(
-            ChatAdd(trip_id=trip.id, place_query=slots.get("place", ""),
-                    day_index=slots.get("to_day"), lang=body.lang), db)}
+        try:
+            change = chat_add(
+                ChatAdd(trip_id=trip.id, place_query=slots.get("place", ""),
+                        day_index=slots.get("to_day"), lang=body.lang), db)
+            ChatTurn.remember(trip.id, "bot",
+                              f"Queued {slots.get('place', '')} — confirm to add it.")
+            return {"kind": "diff", "change": change}
+        except HTTPException as e:
+            ans = str(e.detail)
+            ChatTurn.remember(trip.id, "bot", ans)
+            return {"kind": "answer", "text": ans}
 
     if action == "move":
         act = _find_activity(slots.get("place", ""))
@@ -640,13 +821,16 @@ def chat(body: ChatMessage, db: Session = Depends(get_db)):
         return {"kind": "diff", "change": _change_dict(change)}
 
     if action == "nearby":
-        return {"kind": "answer", "text": llm.phrase(nearby_summary(
+        ans = llm.phrase(nearby_summary(
             ChatNearby(trip_id=trip.id, reference=slots.get("reference", "hotel"), lang=body.lang), db),
-            lang=body.lang)}
+            lang=body.lang)
+        ChatTurn.remember(trip.id, "bot", ans)
+        return {"kind": "answer", "text": ans}
 
     # question
     parsedq = llm.classify_intent(body.message)
     r = nl_query(NLQuery(trip_id=trip.id, question=body.message, lang=body.lang), db)
+    ChatTurn.remember(trip.id, "bot", r["answer"])
     return {"kind": "answer", "text": r["answer"], "intent": parsedq.get("intent")}
 
 
@@ -661,8 +845,29 @@ def nl_query(body: NLQuery, db: Session = Depends(get_db)):
     intent, slots = parsed["intent"], parsed.get("slots", {})
 
     if intent == "day_plan":
-        ref = slots.get("day_reference", "today")
-        idx = 2 if ref == "tomorrow" else 1
+        ref = slots.get("day_reference", "") or ""
+        # 'day 2' / 'second day' / 'tomorrow' all map to a real day index;
+        # out-of-range references answer honestly instead of showing day 1.
+        # The raw question is scanned too — the classifier sometimes drops the slot.
+        import re as _re
+        n_days = db.query(Day).filter_by(trip_id=trip.id).count()
+        idx = 1
+        if "tomorrow" in ref or "tomorrow" in body.question.lower():
+            idx = 2
+        else:
+            m = (_re.search(r"day\s*(\d+)", ref)
+                 or _re.search(r"\b(\d+)(?:st|nd|rd|th)?\s*day", ref)
+                 or _re.search(r"day\s*(\d+)", body.question.lower())
+                 or _re.search(r"\b(\d+)(?:st|nd|rd|th)?\s*day", body.question.lower()))
+            if m:
+                idx = int(m.group(1))
+            elif "last" in ref:
+                idx = n_days
+        if idx > n_days:
+            answer = llm.phrase(
+                f"Your trip has {n_days} day(s) — there's no day {idx}. Ask about day 1 to {n_days}, or say 'tomorrow'.",
+                lang=body.lang)
+            return {"intent": intent, "slots": slots, "answer": answer, "degraded": parsed.get("degraded", False)}
         day = db.query(Day).filter_by(trip_id=trip.id, day_index=idx).first()
         acts = db.query(Activity).filter_by(day_id=day.id).order_by(Activity.seq).all() if day else []
         summary = f"On day {idx}: " + ", ".join(f"{a.name} ({a.start_time})" for a in acts) if acts else "No plan for that day."
@@ -674,9 +879,31 @@ def nl_query(body: NLQuery, db: Session = Depends(get_db)):
         ranked = sorted(acts, key=lambda a: tmap.get((hid, a.place_id), 999))[:3]
         answer = llm.phrase("Closest to your hotel: " + ", ".join(a.name for a in ranked), lang=body.lang)
     elif intent == "what_if_cancel":
-        answer = llm.phrase("Use the inject-disruption action to preview a minimal-diff repair before applying.", lang=body.lang)
+        answer = llm.phrase(
+            "If a booking falls through, I'll propose the smallest change that fixes the day — "
+            "shown as a before/after diff you confirm or reject. Nothing is rewritten silently. "
+            "You can also try it: 'what if Tagore hill is closed?'", lang=body.lang)
     elif intent == "fit_check":
-        answer = llm.phrase("Fit-check runs the validator against a hypothetical insertion (activity name required).", lang=body.lang)
+        name = (slots.get("activity_name") or "").strip()
+        if not name:
+            # classifier dropped the slot: find a planned activity name in the question
+            for a in db.query(Activity).join(Day).filter(Day.trip_id == trip.id).all():
+                if a.name.lower() in body.question.lower():
+                    name = a.name
+                    break
+        act = None
+        if name:
+            act = db.query(Activity).join(Day).filter(Day.trip_id == trip.id) \
+                     .filter(Activity.name.ilike(f"%{name}%")).first()
+        if act:
+            answer = llm.phrase(
+                f"'{act.name}' is on your plan, day {act.day.day_index}, {act.start_time}–{act.end_time} "
+                f"({act.duration_minutes} min). Tell me another stop to check, or say 'add <place>' and I'll find a slot.",
+                lang=body.lang)
+        else:
+            answer = llm.phrase(
+                "Tell me which stop to check (for example: 'can I fit Nucleus Mall?') and I'll see where it fits.",
+                lang=body.lang)
     else:
         answer = llm.phrase("I can help with: your day plan, activities near your hotel, fit-checks, and cancellation what-ifs.", lang=body.lang)
 

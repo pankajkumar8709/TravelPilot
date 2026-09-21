@@ -42,6 +42,8 @@ class ChatMessage(BaseModel):
     trip_id: int
     message: str
     lang: str = "en"
+    # optional client-side transcript (server keeps its own memory too)
+    history: list[dict] | None = None
 
 
 class ChatExplore(BaseModel):
