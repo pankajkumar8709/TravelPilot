@@ -108,18 +108,23 @@ CHAT_ACTIONS = {
 
 
 def classify_chat_action(message: str, day_count: int,
-                         history: list[dict] | None = None) -> dict:
+                         history: list[dict] | None = None,
+                         trip_context: str = "") -> dict:
     """Extract a structured chat action + slots from free-form text.
     Groq when available (understands any phrasing / Hindi), else a keyword mock.
     `history` is the recent conversation [{role, content}] so follow-ups like
     'add that one' can be resolved against what was last offered.
+    `trip_context` is a summary of the current trip (destination, days, budget,
+    activity names) so the LLM understands what the user is referring to.
     Always returns {action, slots} with action in CHAT_ACTIONS."""
     if not settings.use_mock_llm and settings.groq_api_key:
         try:
+            ctx_line = f"Current trip: {trip_context}. " if trip_context else ""
             system = (
                 "You turn a traveler's message about their trip plan into ONE structured action. "
                 f"Actions and slots: {json.dumps(CHAT_ACTIONS)}. "
                 f"The trip has {day_count} days. "
+                f"{ctx_line}"
                 "Rules: 'add' = they want a new place (slot place = just the place name, no day words). "
                 "If the request is GENERIC ('add a museum', 'add a park', 'some shopping'), keep that "
                 "category word as the slot value verbatim (e.g. place='museum', place='park') — never "
@@ -137,6 +142,8 @@ def classify_chat_action(message: str, day_count: int,
                 "(phrases like 'take me to X instead', 'change destination to X', 'replan in X') — "
                 "slot destination = city name only. If X is clearly a place/venue, not a city, use 'add'. "
                 "Use the conversation history to resolve references like 'that one' or 'it'. "
+                "Use the trip context to understand which activities are in the plan and answer questions "
+                "about them (e.g. 'what about the fort' refers to a fort in the trip's day plan). "
                 "Messages may arrive in Hindi, Hinglish, or other languages — understand them and map "
                 "to the same actions (e.g. 'मुझे एक संग्रहालय दिखाओ' = show me a museum -> 'add' with "
                 "place='museum'; 'mujhe X day 2 pe move karo' = 'move'). "
@@ -158,7 +165,7 @@ def classify_chat_action(message: str, day_count: int,
             return data
         except Exception:
             pass
-    return _mock_chat_action(message)
+    return _mock_chat_action(message, history=history)
 
 
 def _mock_chat_action(message: str, history: list[dict] | None = None) -> dict:

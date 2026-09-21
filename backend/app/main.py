@@ -32,6 +32,17 @@ from app.services.trip_service import generate_trip
 from app.services import ors as ors_service
 from app.services import city as city_service
 
+# Budget estimate constants (INR — converted per trip currency by _fx).
+# These keep the rollup honest when cached data is missing: food is never 0
+# (people eat every day), stay falls back to a city-tier rate, and missing
+# travel legs are estimated from distance instead of silently counted as 0.
+MEALS_PER_DAY = 3
+MEAL_COST_INR = 250.0          # avg sit-down meal when no cached food price
+DEFAULT_HOTEL_RATE_INR = 1800.0  # mid-range city hotel when nothing cached
+TRANSPORT_RATE_PER_MIN = 3.0   # ₹3/min ≈ mixed auto/metro/walking
+AVG_CITY_SPEED_KMPH = 18.0     # urban door-to-door speed for leg estimates
+DEFAULT_LEG_MINUTES = 20.0     # last-resort leg time (matches repair_day's default)
+
 app = FastAPI(title="TravelPilot", version="1.0")
 app.add_middleware(
     CORSMiddleware,
@@ -141,24 +152,130 @@ def get_trip(trip_id: int, db: Session = Depends(get_db)):
 
 @app.get("/trips/{trip_id}/budget")
 def budget(trip_id: int, target_currency: str | None = None, db: Session = Depends(get_db)):
+    """Phase 6 — budget rollup with category breakdown (see compute_budget).
+
+    Returns costs split into: activities (entry fees), food (suggestions or a
+    per-meal estimate), stay (hotel × nights, city-tier fallback), and transport
+    (cached legs + distance-based estimates). Each category has per_day and
+    total; grand_total sums them all; `remaining` = budget − grand_total.
+    """
+    return compute_budget(trip_id, target_currency=target_currency, db=db)
+
+
+def compute_budget(trip_id: int, target_currency: str | None = None, db: Session | None = None) -> dict:
+    """Single source of truth for the budget rollup (endpoint + chat Q&A).
+
+    Estimates every category even when cached data is missing:
+      - activities: sum of activity entry costs + bookings
+      - food:       rank-1 food suggestions per meal window; any missing meal
+                    window costs MEAL_COST_INR, so food is never silently 0
+      - stay:       trip hotel rate × nights; falls back to the city's MEDIAN
+                    cached hotel rate (robust to one luxury outlier), then a
+                    city-tier default — per_night always matches the total
+      - transport:  cached travel legs (either direction); missing legs are
+                    estimated from the straight-line distance (haversine ×
+                    detour factor ÷ city speed) instead of counted as 0
+    """
+    if db is None:
+        raise ValueError("a DB session is required")
     trip = db.get(Trip, trip_id)
     if not trip:
         raise HTTPException(404, "trip not found")
     days = db.query(Day).filter_by(trip_id=trip_id).order_by(Day.day_index).all()
-    per_day = []
-    total = 0.0
+    n_days = len(days)
+    n_nights = max(0, n_days - 1)
+
+    # --- activity costs (per-day + total) ---
+    act_per_day = []
+    act_total = 0.0
     for d in days:
-        acts = db.query(Activity).filter_by(day_id=d.id).all()
-        c = sum(a.cost for a in acts)
-        total += c
-        per_day.append({"day_index": d.day_index, "cost": round(c, 2)})
-    total += sum(b.cost for b in db.query(Booking).filter_by(trip_id=trip_id).all())
+        c = sum(a.cost for a in db.query(Activity).filter_by(day_id=d.id).all())
+        act_total += c
+        act_per_day.append({"day_index": d.day_index, "cost": round(c, 2)})
+    act_total += sum(b.cost for b in db.query(Booking).filter_by(trip_id=trip_id).all())
+
+    # --- food costs (rank-1 suggestions per meal window + per-meal fallback) ---
+    food_per_day = []
+    food_total = 0.0
+    for d in days:
+        suggs = db.query(Suggestion).filter_by(day_id=d.id, type="food", rank=1).all()
+        day_food = 0.0
+        for s in suggs:
+            place = db.get(Place, s.place_id)
+            day_food += place.cost if place and place.cost > 0 else MEAL_COST_INR
+        # windows with no suggestion still cost a meal — people eat regardless
+        day_food += max(0, MEALS_PER_DAY - len(suggs)) * MEAL_COST_INR
+        food_total += day_food
+        food_per_day.append({"day_index": d.day_index, "cost": round(day_food, 2)})
+
+    # --- stay costs (hotel rate × nights, tiered fallbacks — never 0) ---
+    hotel = db.get(Place, trip.hotel_place_id) if trip.hotel_place_id else None
+    if hotel and hotel.cost > 0:
+        per_night = float(hotel.cost)
+    else:
+        rates = sorted(h.cost for h in db.query(Place).filter(
+            Place.city == trip.city, Place.category == "hotel", Place.cost > 0
+        ).all()) if trip.city else []
+        per_night = float(rates[len(rates) // 2]) if rates else DEFAULT_HOTEL_RATE_INR
+    stay_total = per_night * n_nights
+    stay_per_day = [{"day_index": d.day_index,
+                     "cost": round(per_night if i < n_nights else 0.0, 2)}
+                    for i, d in enumerate(days)]
+
+    # --- transport costs (cached legs; distance estimate on cache miss) ---
+    def _leg_minutes(a_id: int, b_id: int, a_ll: tuple | None, b_ll: tuple | None) -> float:
+        tt = db.query(TravelTime).filter(
+            ((TravelTime.from_id == a_id) & (TravelTime.to_id == b_id)) |
+            ((TravelTime.from_id == b_id) & (TravelTime.to_id == a_id))).first()
+        if tt:
+            return float(tt.duration_minutes)
+        if a_ll and b_ll:
+            km = _haversine_km(a_ll[0], a_ll[1], b_ll[0], b_ll[1])
+            return max(5.0, km * 1.3 / AVG_CITY_SPEED_KMPH * 60.0)
+        return DEFAULT_LEG_MINUTES
+
+    transport_per_day = []
+    transport_total = 0.0
+    for d in days:
+        acts = db.query(Activity).filter_by(day_id=d.id).order_by(Activity.seq).all()
+        pts = {a.place_id: (a.lat, a.lon) for a in acts}
+        if hotel:
+            pts[hotel.id] = (hotel.lat, hotel.lon)
+        day_mins = 0.0
+        if hotel and acts:
+            day_mins += _leg_minutes(hotel.id, acts[0].place_id,
+                                     pts.get(hotel.id), pts.get(acts[0].place_id))
+        for i in range(len(acts) - 1):
+            day_mins += _leg_minutes(acts[i].place_id, acts[i + 1].place_id,
+                                     pts.get(acts[i].place_id), pts.get(acts[i + 1].place_id))
+        if hotel and acts:
+            day_mins += _leg_minutes(acts[-1].place_id, hotel.id,
+                                     pts.get(acts[-1].place_id), pts.get(hotel.id))
+        day_cost = round(day_mins * TRANSPORT_RATE_PER_MIN, 2)
+        transport_total += day_cost
+        transport_per_day.append({"day_index": d.day_index, "cost": day_cost})
+
+    grand_total = act_total + food_total + stay_total + transport_total
     rate, cur = 1.0, trip.currency
     if target_currency and target_currency != trip.currency:
         rate, cur = _fx(trip.currency, target_currency), target_currency
-    return {"currency": cur, "per_day": [{**p, "cost": round(p["cost"] * rate, 2)} for p in per_day],
-            "total": round(total * rate, 2), "budget_total": round(trip.budget_total * rate, 2),
-            "over_budget": total * rate > trip.budget_total * rate + 1e-6}
+
+    def _conv(items):
+        return [{**p, "cost": round(p["cost"] * rate, 2)} for p in items]
+
+    return {
+        "currency": cur,
+        "activities": {"per_day": _conv(act_per_day), "total": round(act_total * rate, 2)},
+        "food": {"per_day": _conv(food_per_day), "total": round(food_total * rate, 2)},
+        "stay": {"total": round(stay_total * rate, 2), "nights": n_nights,
+                 "hotel_name": hotel.name if hotel else "",
+                 "per_night": round(per_night * rate, 2), "per_day": _conv(stay_per_day)},
+        "transport": {"per_day": _conv(transport_per_day), "total": round(transport_total * rate, 2)},
+        "grand_total": round(grand_total * rate, 2),
+        "budget_total": round(trip.budget_total * rate, 2),
+        "remaining": round((trip.budget_total - grand_total) * rate, 2),
+        "over_budget": grand_total * rate > trip.budget_total * rate + 1e-6,
+    }
 
 
 @app.post("/disruptions/inject")
@@ -674,7 +791,23 @@ def chat(body: ChatMessage, db: Session = Depends(get_db)):
         raise HTTPException(404, "trip not found")
     days = db.query(Day).filter_by(trip_id=trip.id).order_by(Day.day_index).all()
     history = ChatTurn.snapshot(trip.id)
-    parsed = llm.classify_chat_action(body.message, len(days), history=history)
+
+    # Build a rich trip context for the LLM so it understands what the user
+    # is referring to (destination, budget, day summaries, activity names).
+    day_summaries = []
+    for d in days:
+        acts = db.query(Activity).filter_by(day_id=d.id).order_by(Activity.seq).all()
+        names = ", ".join(a.name for a in acts[:5])
+        day_summaries.append(f"Day {d.day_index} ({d.start_time}-{d.end_time}): {names or 'empty'}")
+    trip_context = (
+        f"Trip to {trip.destination}, {trip.start_date} to {trip.end_date}, "
+        f"{len(days)} day(s), budget {trip.currency} {trip.budget_total}, "
+        f"interests: {', '.join(trip.interests or [])}. "
+        f"Days: {'; '.join(day_summaries)}"
+    )
+
+    parsed = llm.classify_chat_action(body.message, len(days), history=history,
+                                       trip_context=trip_context)
     action, slots = parsed["action"], parsed.get("slots", {})
     ChatTurn.remember(trip.id, "user", body.message)
 
@@ -824,6 +957,52 @@ def chat(body: ChatMessage, db: Session = Depends(get_db)):
         ans = llm.phrase(nearby_summary(
             ChatNearby(trip_id=trip.id, reference=slots.get("reference", "hotel"), lang=body.lang), db),
             lang=body.lang)
+        ChatTurn.remember(trip.id, "bot", ans)
+        return {"kind": "answer", "text": ans}
+
+    # greetings / thanks — answer directly, skip intent classification
+    q = body.message.lower().strip().rstrip("!.")
+    if q in {"hi", "hello", "hey", "namaste", "hii", "hiii", "yo", "good morning",
+             "good evening", "good afternoon", "vanakkam"}:
+        ans = (f"Hi! I'm your {trip.destination} trip assistant. I can add or remove places "
+               "(\"add a museum\", \"remove the fort\"), move things between days, rebuild "
+               "the trip in another city, or answer questions about your plan and budget.")
+        ChatTurn.remember(trip.id, "bot", ans)
+        return {"kind": "answer", "text": ans}
+    if q in {"thanks", "thank you", "thank u", "thx", "ty", "shukriya", "dhanyavad"}:
+        ans = "Happy to help! Ask me anything else about the trip."
+        ChatTurn.remember(trip.id, "bot", ans)
+        return {"kind": "answer", "text": ans}
+
+    # budget / spend questions — answer from the SAME rollup the sidebar uses.
+    # Triggered by cost words anywhere, or by a topic word (food/hotel/transport)
+    # when the message isn't a 'near X' proximity question.
+    q_cost = any(w in q for w in ("budget", "spend", "spending", "spent", "cost", "costs",
+                                  "expense", "expensive", "afford", "money", "kharcha",
+                                  "remaining", "left to spend", "price", "how much"))
+    q_topic = ("food" if any(w in q for w in ("food", "meal", "eat", "khana", "restaurant"))
+               else "stay" if any(w in q for w in ("hotel", "stay", "room", "night"))
+               else "transport" if any(w in q for w in ("transport", "travel", "cab", "auto", "metro", "fare"))
+               else "")
+    if q_cost or (q_topic and "near" not in q and "close" not in q):
+        b = compute_budget(trip.id, db=db)
+        sym = {"INR": "₹", "EUR": "€", "USD": "$", "GBP": "£"}.get(b["currency"], b["currency"] + " ")
+        fmt = lambda v: f"{sym}{v:,.0f}"
+        if q_topic == "food":
+            ans = f"Food for the whole trip is estimated at {fmt(b['food']['total'])} — {fmt((b['food']['total'] / max(len(b['food']['per_day']), 1)))} per day (3 meals/day at typical city prices)."
+        elif q_topic == "stay":
+            ans = f"Stay is {fmt(b['stay']['per_night'])} × {b['stay']['nights']} night(s) = {fmt(b['stay']['total'])}"
+            ans += f" at {b['stay']['hotel_name']}." if b["stay"]["hotel_name"] else " at a typical mid-range city hotel rate."
+        elif q_topic == "transport":
+            ans = f"Getting around is estimated at {fmt(b['transport']['total'])} for the trip (~{fmt(b['transport']['total'] / max(len(b['transport']['per_day']), 1))}/day for autos/metro between stops)."
+        else:
+            ans = (f"Your estimated total is {fmt(b['grand_total'])} against a {fmt(b['budget_total'])} budget — "
+                   f"{fmt(abs(b['remaining']))} {'under' if b['remaining'] >= 0 else 'over'}. "
+                   f"Breakdown: activities {fmt(b['activities']['total'])}, food {fmt(b['food']['total'])}, "
+                   f"stay {fmt(b['stay']['total'])}, transport {fmt(b['transport']['total'])}.")
+        if b["over_budget"]:
+            ans += " You're over budget — I can drop or swap a costly stop if you'd like."
+        ans = llm.phrase(ans, lang=body.lang)
         ChatTurn.remember(trip.id, "bot", ans)
         return {"kind": "answer", "text": ans}
 

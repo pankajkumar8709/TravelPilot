@@ -75,11 +75,11 @@ def test_full_flow(client):
 
     # budget rollup (Phase 6)
     b = client.get(f"/trips/{trip['id']}/budget").json()
-    assert "total" in b and "per_day" in b
-    # per-day entries exist for each day and total equals the sum of per-day costs
-    assert len(b["per_day"]) == len(trip["days"])
-    day_sum = round(sum(p["cost"] for p in b["per_day"]), 2)
-    assert abs(b["total"] - day_sum) < 0.01, "total must equal sum of per-day costs"
+    # New format: category breakdown (activities, food, stay, transport) + budget_total
+    assert "activities" in b and "food" in b and "stay" in b and "transport" in b
+    assert "budget_total" in b and "currency" in b
+    # Activities per-day entries exist
+    assert len(b["activities"]["per_day"]) == len(trip["days"])
     assert "over_budget" in b
 
     # inject a disruption on day 1's LAST activity (minimal change expected)
